@@ -89,6 +89,20 @@ describe("PUT /v1/vault preconditions", () => {
     const body = await response.json() as ErrorBody;
     expect(body.error.code).toBe("precondition_required");
   });
+
+  it("PUT vault with invalid JSON is 400 invalid_json", async () => {
+    const response = await putVault({ schema: "nope" });
+    expect(response.status).toBe(400);
+    const body = await response.json() as ErrorBody;
+    expect(body.error.code).toBe("invalid_json");
+  });
+
+  it("GET /v1/vault is 404 when the vault has not been created", async () => {
+    const response = await getVault();
+    expect(response.status).toBe(404);
+    const body = await response.json() as ErrorBody;
+    expect(body.error.code).toBe("not_found");
+  });
 });
 
 describe("GET /v1/index and method restrictions", () => {

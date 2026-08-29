@@ -256,3 +256,65 @@ describe("GET /v1/index sinceRevision", () => {
     expect(filtered.items[0]?.revision).toBe(3);
   });
 });
+
+describe("object path and delete edges", () => {
+  beforeEach(async () => {
+    expect((await putVault(vaultDocument())).status).toBe(201);
+  });
+
+  it("rejects uppercase uuid paths with 400 invalid_path", async () => {
+    const response = await putObject(
+      objectUrl("prompts", "11111111-2222-4333-8444-55555555555A"),
+      vpbeBody(),
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json() as ErrorBody;
+    expect(body.error.code).toBe("invalid_path");
+  });
+
+  it("PUT without If-Match or If-None-Match is 428", async () => {
+    const response = await fetchConfigured(LIVE_URL, {
+      method: "PUT",
+      headers: await writeHeaders(),
+      body: vpbeBody(),
+    });
+    expect(response.status).toBe(428);
+    const body = await response.json() as ErrorBody;
+    expect(body.error.code).toBe("precondition_required");
+  });
+
+  it("DELETE live without If-Match is 428", async () => {
+    expect((await putObject(LIVE_URL, vpbeBody())).status).toBe(201);
+    const response = await deleteObject(LIVE_URL);
+    expect(response.status).toBe(428);
+    const body = await response.json() as ErrorBody;
+    expect(body.error.code).toBe("precondition_required");
+  });
+
+  it("DELETE tombstone wipes it without recreating the live object", async () => {
+    expect((await putObject(LIVE_URL, vpbeBody())).status).toBe(201);
+    const tombstone = await putObject(
+      TOMBSTONE_URL,
+      JSON.stringify(tombstoneDocument()),
+    );
+    expect(tombstone.status).toBe(201);
+    const etag = tombstone.headers.get("ETag");
+    expect(etag).toBeTruthy();
+
+    const deleted = await deleteObject(TOMBSTONE_URL, { "If-Match": etag! });
+    expect(deleted.status).toBe(204);
+    expect((await getObject(TOMBSTONE_URL)).status).toBe(404);
+    expect((await getObject(LIVE_URL)).status).toBe(404);
+    expect(itemsForPrompt(await (await getIndex()).json() as IndexBody)).toEqual([]);
+  });
+
+  it("PUT scope VPBE is indexed as kind scope", async () => {
+    const url = objectUrl("scopes", "inbox.main");
+    const created = await putObject(url, vpbeBody());
+    expect(created.status).toBe(201);
+    const index = await (await getIndex()).json() as IndexBody;
+    const item = index.items.find((entry) => entry.id === "inbox.main");
+    expect(item?.kind).toBe("scope");
+    expect(item?.deleted).toBe(false);
+  });
+});
