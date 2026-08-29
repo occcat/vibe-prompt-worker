@@ -1,6 +1,7 @@
 import { verifyAuthorization } from "./auth";
 import { errorResponse, jsonResponse } from "./http";
-import { isObjectPutTooLarge } from "./limits";
+import { isObjectPutTooLarge, isSnapshotPutTooLarge } from "./limits";
+import { isSnapshotRoute } from "./paths";
 
 export { VaultObject } from "./vault-object";
 
@@ -82,11 +83,27 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return errorResponse(413, "payload_too_large", "Payload too large.");
   }
 
+  if (isSnapshotPutTooLarge(request)) {
+    return errorResponse(413, "payload_too_large", "Payload too large.");
+  }
+
+  if (isSnapshotRoute(pathname) && !hasSnapshotsBinding(env)) {
+    return errorResponse(503, "misconfigured", "Must bind SNAPSHOTS R2 bucket.");
+  }
+
   return env.VAULT.get(env.VAULT.idFromName("vault")).fetch(request);
 }
 
 function isAuthConfigured(value: string | undefined): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function hasSnapshotsBinding(env: Env): boolean {
+  try {
+    return env.SNAPSHOTS !== undefined && env.SNAPSHOTS !== null;
+  } catch {
+    return false;
+  }
 }
 
 function isSharePath(pathname: string): boolean {

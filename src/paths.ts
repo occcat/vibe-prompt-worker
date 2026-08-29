@@ -41,6 +41,27 @@ export type ParseObjectPathResult =
   | { ok: true; value: ParsedObject }
   | { ok: false; reason: "not_object" | "invalid_path" };
 
+export type SnapshotKind = "auto" | "backup";
+
+export type ParsedSnapshotList = {
+  type: "list";
+};
+
+export type ParsedSnapshotItem = {
+  type: "item";
+  filename: string;
+  kind: SnapshotKind;
+};
+
+export type ParsedSnapshot = ParsedSnapshotList | ParsedSnapshotItem;
+
+export type ParseSnapshotPathResult =
+  | { ok: true; value: ParsedSnapshot }
+  | { ok: false; reason: "not_snapshot" | "invalid_path" };
+
+const SNAPSHOT_FILENAME_RE =
+  /^vibe-prompt-(auto|backup)_(\d{8}T\d{6}Z)_([0-9a-f]{8})_([0-9a-f]{6})\.vpb$/;
+
 export function liveBlobPath(urlKind: LiveUrlKind, id: string): string {
   return `objects/${urlKind}/${id}.vpb`;
 }
@@ -139,4 +160,43 @@ export function parseObjectPath(pathname: string): ParseObjectPathResult {
     return { ok: true, value: tombstoneObject(targetKind, targetId) };
   }
   return { ok: false, reason: "not_object" };
+}
+
+export function isSnapshotRoute(pathname: string): boolean {
+  return pathname === "/v1/snapshots" || pathname.startsWith("/v1/snapshots/");
+}
+
+export function parseSnapshotPath(pathname: string): ParseSnapshotPathResult {
+  if (pathname === "/v1/snapshots") {
+    return { ok: true, value: { type: "list" } };
+  }
+  if (!pathname.startsWith("/v1/snapshots/")) {
+    return { ok: false, reason: "not_snapshot" };
+  }
+  if (pathname.includes("..") || pathname.includes("\\") || hasNonAscii(pathname)) {
+    return { ok: false, reason: "invalid_path" };
+  }
+  const rest = pathname.slice("/v1/snapshots/".length);
+  if (rest === "" || rest.includes("/")) {
+    return { ok: false, reason: "invalid_path" };
+  }
+  let filename: string;
+  try {
+    filename = decodeURIComponent(rest);
+  } catch {
+    return { ok: false, reason: "invalid_path" };
+  }
+  const match = SNAPSHOT_FILENAME_RE.exec(filename);
+  const kind = match?.[1];
+  if (kind !== "auto" && kind !== "backup") {
+    return { ok: false, reason: "invalid_path" };
+  }
+  return {
+    ok: true,
+    value: {
+      type: "item",
+      filename,
+      kind,
+    },
+  };
 }

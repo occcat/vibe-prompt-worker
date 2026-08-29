@@ -9,6 +9,7 @@ export const PROTOCOL_HEADER = "X-Vibe-Prompt-Protocol";
 export const VAULT_URL = "https://worker.test/v1/vault";
 export const INDEX_URL = "https://worker.test/v1/index";
 export const HEALTH_URL = "https://worker.test/v1/health";
+export const SNAPSHOTS_URL = "https://worker.test/v1/snapshots";
 export const VAULT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 export const KDF_SALT = "0123456789abcdef0123456789abcdef";
 export const PROMPT_ID = "11111111-2222-4333-8444-555555555555";
@@ -19,8 +20,16 @@ export function configuredEnv(authValue = AUTH_VALUE): Env {
 }
 
 export async function fetchConfigured(input: string, init?: RequestInit): Promise<Response> {
+  return fetchWithEnv(configuredEnv(), input, init);
+}
+
+export async function fetchWithEnv(
+  workerEnv: Env,
+  input: string,
+  init?: RequestInit,
+): Promise<Response> {
   const ctx = createExecutionContext();
-  const response = await worker.fetch(new Request(input, init), configuredEnv(), ctx);
+  const response = await worker.fetch(new Request(input, init), workerEnv, ctx);
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -149,6 +158,54 @@ export async function deleteObject(url: string, extra?: HeadersInit): Promise<Re
     headers: await writeHeaders(extra),
   });
 }
+
+export function snapshotUrl(filename: string): string {
+  return `${SNAPSHOTS_URL}/${filename}`;
+}
+
+export function snapshotFilename(
+  kind: "auto" | "backup",
+  seq: number,
+): string {
+  const utc = `20260829T${seq.toString().padStart(6, "0")}Z`;
+  const device = "aaaaaaaa";
+  const rand = seq.toString(16).padStart(6, "0");
+  return `vibe-prompt-${kind}_${utc}_${device}_${rand}.vpb`;
+}
+
+export async function putSnapshot(
+  filename: string,
+  body: BodyInit,
+  extra?: HeadersInit,
+): Promise<Response> {
+  const headers = await writeHeaders(extra);
+  if (!headers.has("If-Match") && !headers.has("If-None-Match")) {
+    headers.set("If-None-Match", "*");
+  }
+  return fetchConfigured(snapshotUrl(filename), {
+    method: "PUT",
+    headers,
+    body,
+  });
+}
+
+export async function getSnapshots(): Promise<Response> {
+  return fetchConfigured(SNAPSHOTS_URL, { headers: await authHeaders() });
+}
+
+export async function getSnapshot(filename: string): Promise<Response> {
+  return fetchConfigured(snapshotUrl(filename), { headers: await authHeaders() });
+}
+
+export type SnapshotListBody = {
+  schema: string;
+  items: Array<{
+    filename: string;
+    etag: string;
+    bytes: number;
+    updatedAt: string;
+  }>;
+};
 
 export function paddedUuid(n: number): string {
   return `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
