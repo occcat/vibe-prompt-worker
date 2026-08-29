@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a reproducible problem with vibe-prompt-worker.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve vibe-prompt-worker. Search existing issues first and include the smallest reliable reproduction you can provide.
+
+        For security vulnerabilities, use a [private security advisory](https://github.com/occcat/vibe-prompt-worker/security/advisories/new) instead.
+
+        Never paste `AUTH_VALUE`, `vaultPassword`, Cloudflare API tokens, account IDs, ciphertext, or personal Worker URLs.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - HTTP API
+        - Authentication
+        - Durable Object / SQLite
+        - R2 snapshots
+        - Deploy or CI
+        - Documentation
+        - Other or unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and why it is a problem.
+      placeholder: Tell us what went wrong. Include the exact error code when available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal, repeatable sequence. Redact secrets and personal hostnames.
+      placeholder: |
+        1. Deploy or run locally ...
+        2. Call ...
+        3. Observe ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA, tag, or deploy date. Do not include account IDs or Worker hostnames.
+      placeholder: "main @ abcdef1"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Node.js version, wrangler version, and Workers plan (Free or Paid). Do not include account IDs.
+      placeholder: "Node 22, wrangler 4, Workers Free"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or response bodies
+      description: Paste relevant logs or JSON errors. Remove tokens, passwords, ciphertext, and personal URLs.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add any other details that may help, such as frequency, workarounds, or recent changes.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and did not find a duplicate.
+          required: true
+        - label: I removed secrets, tokens, ciphertext, and personal Worker URLs from this report.
+          required: true

@@ -1,0 +1,67 @@
+name: Feature request
+description: Propose an improvement to vibe-prompt-worker.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - Feature request
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the operator problem before the proposed implementation. Broader ideas and early-stage discussion are welcome in [GitHub Discussions](https://github.com/occcat/vibe-prompt-worker/discussions).
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - HTTP API
+        - Authentication
+        - Durable Object / SQLite
+        - R2 snapshots
+        - Deploy or CI
+        - Documentation
+        - Other or unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What workflow is difficult or impossible today, and who is affected?
+      placeholder: When I try to ..., I cannot ... because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like. Keep the proposal focused on the smallest useful outcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe current workarounds or other approaches you considered.
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples or references
+      description: Add sanitized request shapes, code samples, or links when useful. No secrets.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for a similar request.
+          required: true
+        - label: This request describes one focused problem.
+          required: true
+        - label: I removed secrets, tokens, ciphertext, and personal Worker URLs.
+          required: true

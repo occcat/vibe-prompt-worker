@@ -1,0 +1,51 @@
+name: Documentation issue
+description: Report missing, incorrect, or unclear documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Documentation area
+      options:
+        - README (English)
+        - README (简体中文)
+        - Contributing or security policy
+        - Issue or pull request templates
+        - Other or unsure
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: Link to the page or provide the repository path and section.
+      placeholder: "README.md#quick-start"
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What needs improvement?
+      description: Explain what is missing, incorrect, outdated, or hard to understand.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested change
+      description: Share the wording, example, or structure you think would help. No secrets.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the current documentation and searched for an existing issue.
+          required: true
+        - label: I removed secrets, tokens, ciphertext, and personal Worker URLs.
+          required: true

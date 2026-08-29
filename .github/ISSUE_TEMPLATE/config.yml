@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/occcat/vibe-prompt-worker/discussions
+    about: Ask for help or discuss ideas that are not yet actionable issues.
+  - name: Documentation
+    url: https://github.com/occcat/vibe-prompt-worker#readme
+    about: Read the README before opening an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/occcat/vibe-prompt-worker/security/advisories/new
+    about: Privately report vulnerabilities. Do not disclose them in a public issue.
