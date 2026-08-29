@@ -1,0 +1,3 @@
+# Runtime Secret for the client sync password. Not a Cloudflare API Token and not vaultPassword.
+# Copy to `.dev.vars` and set a long random string. Leave empty here; never commit `.dev.vars`.
+AUTH_VALUE=
