@@ -8,8 +8,16 @@ import {
   quoteEtag,
   revisionHeaders,
 } from "./http";
-import { evaluatePreconditions } from "./preconditions";
-import { parseVaultJson, type VaultDocument } from "./validate";
+import { indexWouldExceedLimit, MAX_OBJECT_BYTES } from "./limits";
+import { hasVpbeMagic } from "./magic";
+import { parseObjectPath, type ParsedObject } from "./paths";
+import { evaluateIfMatch, evaluatePreconditions } from "./preconditions";
+import {
+  parseTombstoneJson,
+  parseVaultJson,
+  type TombstoneDocument,
+  type VaultDocument,
+} from "./validate";
 
 const META_VAULT_JSON = "vault_json";
 const META_VAULT_REVISION = "vault_revision";
@@ -111,6 +119,23 @@ export class VaultObject extends DurableObject<Env> {
     if (pathname === "/v1/index") {
       if (request.method === "GET") {
         return this.getIndex(url);
+      }
+      return errorResponse(405, "method_not_allowed", "Method Not Allowed");
+    }
+
+    const parsed = parseObjectPath(pathname);
+    if (!parsed.ok && parsed.reason === "invalid_path") {
+      return errorResponse(400, "invalid_path", "Invalid path.");
+    }
+    if (parsed.ok) {
+      if (request.method === "GET") {
+        return this.getObject(parsed.value);
+      }
+      if (request.method === "PUT") {
+        return await this.putObject(request, parsed.value);
+      }
+      if (request.method === "DELETE") {
+        return this.deleteObject(request, parsed.value);
       }
       return errorResponse(405, "method_not_allowed", "Method Not Allowed");
     }
@@ -294,5 +319,285 @@ export class VaultObject extends DurableObject<Env> {
       items: index.items.filter((item) => item.revision > sinceRevision),
     };
     return jsonResponse(sortKeys(filtered), 200, revisionHeaders(index.revision));
+  }
+
+  private getBlob(path: string): BlobRow | null {
+    const row = this.ctx.storage.sql.exec<BlobRow>(
+      "SELECT path, etag, revision, bytes, updated_at, body FROM blobs WHERE path = ?",
+      path,
+    ).toArray()[0];
+    return row ?? null;
+  }
+
+  private upsertBlob(
+    path: string,
+    etag: string,
+    revision: number,
+    body: ArrayBuffer,
+    updatedAt: string,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO blobs (path, etag, revision, bytes, updated_at, body)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(path) DO UPDATE SET
+         etag = excluded.etag,
+         revision = excluded.revision,
+         bytes = excluded.bytes,
+         updated_at = excluded.updated_at,
+         body = excluded.body`,
+      path,
+      etag,
+      revision,
+      body.byteLength,
+      updatedAt,
+      body,
+    );
+  }
+
+  private deleteBlob(path: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM blobs WHERE path = ?", path);
+  }
+
+  private utf8Bytes(text: string): ArrayBuffer {
+    const bytes = new TextEncoder().encode(text);
+    return bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
+  }
+
+  private sortItems(items: IndexItem[]): IndexItem[] {
+    return [...items].sort((left, right) => {
+      const kindOrder = left.kind.localeCompare(right.kind);
+      if (kindOrder !== 0) {
+        return kindOrder;
+      }
+      return left.id.localeCompare(right.id);
+    });
+  }
+
+  private wouldExceedIndex(dropIds: string[], next: IndexItem): boolean {
+    const current = this.buildIndex();
+    const drop = new Set(dropIds);
+    const items = this.sortItems([
+      ...current.items.filter((item) => !drop.has(item.id)),
+      next,
+    ]);
+    const preview: IndexDocument = {
+      items,
+      revision: next.revision,
+      schema: INDEX_SCHEMA,
+      updatedAt: next.updatedAt,
+    };
+    const serialized = new TextEncoder().encode(canonicalJson(preview)).byteLength;
+    return indexWouldExceedLimit(items.length, serialized);
+  }
+
+  private getObject(path: ParsedObject): Response {
+    const row = this.getBlob(path.blobPath);
+    if (row === null) {
+      return errorResponse(404, "not_found", "Not Found");
+    }
+    const headers = revisionHeaders(row.revision);
+    if (path.type === "tombstone") {
+      headers.set("content-type", "application/json");
+    } else {
+      headers.set("content-type", "application/octet-stream");
+    }
+    return new Response(row.body, { status: 200, headers });
+  }
+
+  private async putObject(request: Request, path: ParsedObject): Promise<Response> {
+    if (path.type === "tombstone") {
+      return await this.putTombstone(request, path);
+    }
+    return await this.putLive(request, path);
+  }
+
+  private async putLive(
+    request: Request,
+    path: Extract<ParsedObject, { type: "live" }>,
+  ): Promise<Response> {
+    const current = this.getBlob(path.blobPath);
+    const pre = evaluatePreconditions(
+      current !== null,
+      current?.etag ?? null,
+      current?.revision ?? null,
+      request,
+    );
+    if (pre.type === "error") {
+      return pre.response;
+    }
+
+    const buffer = await request.arrayBuffer();
+    if (buffer.byteLength > MAX_OBJECT_BYTES) {
+      return errorResponse(413, "payload_too_large", "Payload too large.");
+    }
+    const encryption = this.loadVault()?.document.encryption ?? "required";
+    if (encryption === "required" && !hasVpbeMagic(new Uint8Array(buffer))) {
+      return errorResponse(400, "invalid_magic", "Invalid magic.");
+    }
+
+    const now = formatCanonicalUtc();
+    const revision = this.objectRevision() + 1;
+    const etag = quoteEtag(revision);
+    const nextItem: IndexItem = {
+      bytes: buffer.byteLength,
+      deleted: false,
+      etag,
+      id: path.id,
+      kind: path.indexKind,
+      revision,
+      updatedAt: now,
+    };
+    if (this.wouldExceedIndex([path.id, path.tombstoneIndexId], nextItem)) {
+      return errorResponse(507, "index_too_large", "Index too large.");
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.upsertBlob(path.blobPath, etag, revision, buffer, now);
+      this.deleteBlob(path.tombstoneBlobPath);
+      this.setMeta(META_OBJECT_REVISION, String(revision));
+      this.setMeta(META_INDEX_UPDATED_AT, now);
+    });
+    return emptyRevisionResponse(pre.mode === "create" ? 201 : 204, revision);
+  }
+
+  private async putTombstone(
+    request: Request,
+    path: Extract<ParsedObject, { type: "tombstone" }>,
+  ): Promise<Response> {
+    const current = this.getBlob(path.blobPath);
+    const pre = evaluatePreconditions(
+      current !== null,
+      current?.etag ?? null,
+      current?.revision ?? null,
+      request,
+    );
+    if (pre.type === "error") {
+      return pre.response;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await request.text()) as unknown;
+    } catch {
+      return errorResponse(400, "invalid_json", "Invalid JSON.");
+    }
+    const document = parseTombstoneJson(parsed, {
+      targetKind: path.targetKind,
+      id: path.id,
+    });
+    if (document === null) {
+      return errorResponse(400, "invalid_json", "Invalid JSON.");
+    }
+
+    const body = this.utf8Bytes(canonicalJson(document));
+    if (body.byteLength > MAX_OBJECT_BYTES) {
+      return errorResponse(413, "payload_too_large", "Payload too large.");
+    }
+
+    const now = formatCanonicalUtc();
+    const revision = this.objectRevision() + 1;
+    const etag = quoteEtag(revision);
+    const nextItem: IndexItem = {
+      bytes: body.byteLength,
+      deleted: true,
+      etag,
+      id: path.indexId,
+      kind: "tombstone",
+      revision,
+      updatedAt: now,
+    };
+    if (this.wouldExceedIndex([path.id, path.indexId], nextItem)) {
+      return errorResponse(507, "index_too_large", "Index too large.");
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.upsertBlob(path.blobPath, etag, revision, body, now);
+      this.deleteBlob(path.liveBlobPath);
+      this.setMeta(META_OBJECT_REVISION, String(revision));
+      this.setMeta(META_INDEX_UPDATED_AT, now);
+    });
+    return emptyRevisionResponse(pre.mode === "create" ? 201 : 204, revision);
+  }
+
+  private deleteObject(request: Request, path: ParsedObject): Response {
+    if (path.type === "tombstone") {
+      return this.deleteTombstone(request, path);
+    }
+    return this.deleteLive(request, path);
+  }
+
+  private deleteLive(
+    request: Request,
+    path: Extract<ParsedObject, { type: "live" }>,
+  ): Response {
+    const current = this.getBlob(path.blobPath);
+    const pre = evaluateIfMatch(
+      current !== null,
+      current?.etag ?? null,
+      current?.revision ?? null,
+      request,
+    );
+    if (pre.type === "error") {
+      return pre.response;
+    }
+
+    const now = formatCanonicalUtc();
+    const revision = this.objectRevision() + 1;
+    const etag = quoteEtag(revision);
+    const document: TombstoneDocument = {
+      schema: "vibe-prompt.tombstone/1",
+      targetKind: path.indexKind,
+      id: path.id,
+      deletedAt: now,
+    };
+    const body = this.utf8Bytes(canonicalJson(document));
+    const nextItem: IndexItem = {
+      bytes: body.byteLength,
+      deleted: true,
+      etag,
+      id: path.tombstoneIndexId,
+      kind: "tombstone",
+      revision,
+      updatedAt: now,
+    };
+    if (this.wouldExceedIndex([path.id, path.tombstoneIndexId], nextItem)) {
+      return errorResponse(507, "index_too_large", "Index too large.");
+    }
+
+    this.ctx.storage.transactionSync(() => {
+      this.deleteBlob(path.blobPath);
+      this.upsertBlob(path.tombstoneBlobPath, etag, revision, body, now);
+      this.setMeta(META_OBJECT_REVISION, String(revision));
+      this.setMeta(META_INDEX_UPDATED_AT, now);
+    });
+    return emptyRevisionResponse(204, revision);
+  }
+
+  private deleteTombstone(
+    request: Request,
+    path: Extract<ParsedObject, { type: "tombstone" }>,
+  ): Response {
+    const current = this.getBlob(path.blobPath);
+    const pre = evaluateIfMatch(
+      current !== null,
+      current?.etag ?? null,
+      current?.revision ?? null,
+      request,
+    );
+    if (pre.type === "error") {
+      return pre.response;
+    }
+
+    const now = formatCanonicalUtc();
+    const revision = this.objectRevision() + 1;
+    this.ctx.storage.transactionSync(() => {
+      this.deleteBlob(path.blobPath);
+      this.setMeta(META_OBJECT_REVISION, String(revision));
+      this.setMeta(META_INDEX_UPDATED_AT, now);
+    });
+    return emptyRevisionResponse(204, revision);
   }
 }
