@@ -10,4 +10,7 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
     }),
   ],
+  test: {
+    setupFiles: ["./test/setup.ts"],
+  },
 });

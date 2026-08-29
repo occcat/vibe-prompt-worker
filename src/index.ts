@@ -1,6 +1,8 @@
-import { DurableObject } from "cloudflare:workers";
-
 import { verifyAuthorization } from "./auth";
+import { errorResponse, jsonResponse } from "./http";
+import { isObjectPutTooLarge } from "./limits";
+
+export { VaultObject } from "./vault-object";
 
 const WORKER_NAME = "vibe-prompt-worker";
 const HEALTH_SCHEMA = "vibe-prompt.health/1";
@@ -22,12 +24,6 @@ const CORS_HEADERS = {
   ].join(", "),
   "Access-Control-Expose-Headers": "ETag, X-Vibe-Prompt-Revision",
 };
-
-export class VaultObject extends DurableObject<Env> {
-  fetch(): Response {
-    return new Response("Not Implemented", { status: 501 });
-  }
-}
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -82,7 +78,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return errorResponse(400, "invalid_protocol", "X-Vibe-Prompt-Protocol must be 1.");
   }
 
-  return errorResponse(404, "not_found", "Not Found");
+  if (isObjectPutTooLarge(request)) {
+    return errorResponse(413, "payload_too_large", "Payload too large.");
+  }
+
+  return env.VAULT.get(env.VAULT.idFromName("vault")).fetch(request);
 }
 
 function isAuthConfigured(value: string | undefined): value is string {
@@ -111,22 +111,4 @@ function withCors(response: Response): Response {
     statusText: response.statusText,
     headers,
   });
-}
-
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-type ErrorCode =
-  | "unauthorized"
-  | "forbidden"
-  | "misconfigured"
-  | "not_found"
-  | "invalid_protocol";
-
-function errorResponse(status: number, code: ErrorCode, message: string): Response {
-  return jsonResponse({ error: { code, message } }, status);
 }
