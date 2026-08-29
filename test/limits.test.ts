@@ -3,11 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   indexWouldExceedLimit,
   isObjectPutTooLarge,
+  isSnapshotPutTooLarge,
   MAX_INDEX_BYTES,
   MAX_INDEX_ITEMS,
   MAX_OBJECT_BYTES,
+  MAX_SNAPSHOT_BYTES,
 } from "../src/limits";
-import { PROMPT_ID } from "./helpers";
+import { PROMPT_ID, snapshotFilename } from "./helpers";
 
 describe("indexWouldExceedLimit", () => {
   it("allows 8000 items and 4 MiB exactly", () => {
@@ -35,5 +37,22 @@ describe("isObjectPutTooLarge", () => {
       headers: { "Content-Length": String(MAX_OBJECT_BYTES) },
     });
     expect(isObjectPutTooLarge(allowed)).toBe(false);
+  });
+});
+
+describe("isSnapshotPutTooLarge", () => {
+  it("rejects snapshot PUTs whose Content-Length exceeds 20 MiB", () => {
+    const url = `https://worker.test/v1/snapshots/${snapshotFilename("auto", 1)}`;
+    const large = new Request(url, {
+      method: "PUT",
+      headers: { "Content-Length": String(MAX_SNAPSHOT_BYTES + 1) },
+    });
+    expect(isSnapshotPutTooLarge(large)).toBe(true);
+
+    const allowed = new Request(url, {
+      method: "PUT",
+      headers: { "Content-Length": String(MAX_SNAPSHOT_BYTES) },
+    });
+    expect(isSnapshotPutTooLarge(allowed)).toBe(false);
   });
 });

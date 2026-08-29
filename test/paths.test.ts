@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { parseObjectPath } from "../src/paths";
-import { PROMPT_ID } from "./helpers";
+import { parseObjectPath, parseSnapshotPath } from "../src/paths";
+import { PROMPT_ID, snapshotFilename } from "./helpers";
 
 describe("parseObjectPath", () => {
   it("accepts live prompt uuids and encoded tombstone ids", () => {
@@ -42,6 +42,36 @@ describe("parseObjectPath", () => {
       reason: "invalid_path",
     });
     expect(parseObjectPath("/v1/objects/prompts/prompt-你好")).toEqual({
+      ok: false,
+      reason: "invalid_path",
+    });
+  });
+});
+
+describe("parseSnapshotPath", () => {
+  it("accepts the list path and valid auto/backup filenames", () => {
+    expect(parseSnapshotPath("/v1/snapshots")).toEqual({
+      ok: true,
+      value: { type: "list" },
+    });
+    const autoName = snapshotFilename("auto", 1);
+    expect(parseSnapshotPath(`/v1/snapshots/${autoName}`)).toEqual({
+      ok: true,
+      value: { type: "item", filename: autoName, kind: "auto" },
+    });
+    const backupName = snapshotFilename("backup", 2);
+    expect(parseSnapshotPath(`/v1/snapshots/${backupName}`)).toEqual({
+      ok: true,
+      value: { type: "item", filename: backupName, kind: "backup" },
+    });
+  });
+
+  it("rejects invalid snapshot filenames", () => {
+    expect(parseSnapshotPath("/v1/snapshots/not-a-snapshot.vpb")).toEqual({
+      ok: false,
+      reason: "invalid_path",
+    });
+    expect(parseSnapshotPath("/v1/snapshots/vibe-prompt-auto_bad.vpb")).toEqual({
       ok: false,
       reason: "invalid_path",
     });

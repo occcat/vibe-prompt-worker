@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
+import { contentLengthOf, takePrefix, toFixedLengthStream } from "./body-stream";
 import { canonicalJson, formatCanonicalUtc, sortKeys } from "./canonical";
 import {
   emptyRevisionResponse,
@@ -10,7 +11,13 @@ import {
 } from "./http";
 import { indexWouldExceedLimit, MAX_OBJECT_BYTES } from "./limits";
 import { hasVpbeMagic } from "./magic";
-import { parseObjectPath, type ParsedObject } from "./paths";
+import {
+  parseObjectPath,
+  parseSnapshotPath,
+  type ParsedObject,
+  type ParsedSnapshot,
+  type ParsedSnapshotItem,
+} from "./paths";
 import { evaluateIfMatch, evaluatePreconditions } from "./preconditions";
 import {
   parseTombstoneJson,
@@ -24,7 +31,9 @@ const META_VAULT_REVISION = "vault_revision";
 const META_OBJECT_REVISION = "object_revision";
 const META_INDEX_UPDATED_AT = "index_updated_at";
 const INDEX_SCHEMA = "vibe-prompt.index/1";
+const SNAPSHOTS_SCHEMA = "vibe-prompt.snapshots/1";
 const ZERO_TIME = "1970-01-01T00:00:00.000Z";
+const SNAPSHOTS_MISCONFIGURED = "Must bind SNAPSHOTS R2 bucket.";
 
 type BlobRow = {
   path: string;
@@ -53,6 +62,29 @@ type IndexDocument = {
   schema: typeof INDEX_SCHEMA;
   updatedAt: string;
 };
+
+type SnapshotRow = {
+  filename: string;
+  etag: string;
+  bytes: number;
+  updated_at: string;
+  r2_key: string;
+};
+
+type SnapshotListItem = {
+  bytes: number;
+  etag: string;
+  filename: string;
+  updatedAt: string;
+};
+
+type SnapshotUpload =
+  | {
+      type: "ok";
+      body: ReadableStream<Uint8Array> | ArrayBufferView;
+      done: Promise<void> | null;
+    }
+  | { type: "error"; response: Response };
 
 export class VaultObject extends DurableObject<Env> {
   private queue: Promise<unknown>;
@@ -88,6 +120,15 @@ export class VaultObject extends DurableObject<Env> {
         v TEXT NOT NULL
       )
     `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS snapshots (
+        filename TEXT PRIMARY KEY,
+        etag TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        r2_key TEXT NOT NULL
+      )
+    `);
   }
 
   private async handleRequest(request: Request): Promise<Response> {
@@ -121,6 +162,14 @@ export class VaultObject extends DurableObject<Env> {
         return this.getIndex(url);
       }
       return errorResponse(405, "method_not_allowed", "Method Not Allowed");
+    }
+
+    const snapshot = parseSnapshotPath(pathname);
+    if (!snapshot.ok && snapshot.reason === "invalid_path") {
+      return errorResponse(400, "invalid_path", "Invalid path.");
+    }
+    if (snapshot.ok) {
+      return await this.routeSnapshot(request, snapshot.value);
     }
 
     const parsed = parseObjectPath(pathname);
@@ -599,5 +648,277 @@ export class VaultObject extends DurableObject<Env> {
       this.setMeta(META_INDEX_UPDATED_AT, now);
     });
     return emptyRevisionResponse(204, revision);
+  }
+
+  private snapshotsBucket(): R2Bucket | null {
+    try {
+      const bucket = this.env.SNAPSHOTS;
+      if (bucket === undefined || bucket === null) {
+        return null;
+      }
+      return bucket;
+    } catch {
+      return null;
+    }
+  }
+
+  private snapshotHeaders(etag: string): Headers {
+    const headers = new Headers();
+    headers.set("ETag", etag);
+    headers.set("X-Vibe-Prompt-Revision", String(this.objectRevision()));
+    return headers;
+  }
+
+  private snapshotEtag(object: R2Object): string {
+    if (object.httpEtag !== "") {
+      return object.httpEtag;
+    }
+    return `"${object.etag}"`;
+  }
+
+  private r2Misconfigured(): Response {
+    return errorResponse(503, "misconfigured", SNAPSHOTS_MISCONFIGURED);
+  }
+
+  private async snapshotUploadBody(
+    request: Request,
+    encryption: VaultDocument["encryption"],
+  ): Promise<SnapshotUpload> {
+    if (encryption !== "required") {
+      return { type: "ok", body: request.body ?? new Uint8Array(), done: null };
+    }
+    const prefixed = await takePrefix(request.body, 4);
+    if (!hasVpbeMagic(prefixed.prefix)) {
+      await prefixed.stream.cancel();
+      return {
+        type: "error",
+        response: errorResponse(400, "invalid_magic", "Invalid magic."),
+      };
+    }
+    const length = contentLengthOf(request);
+    if (length === null) {
+      const buffered = new Uint8Array(
+        await new Response(prefixed.stream).arrayBuffer(),
+      );
+      return { type: "ok", body: buffered, done: null };
+    }
+    const fixed = toFixedLengthStream(prefixed.stream, length);
+    return { type: "ok", body: fixed.readable, done: fixed.done };
+  }
+
+  private async routeSnapshot(
+    request: Request,
+    snapshot: ParsedSnapshot,
+  ): Promise<Response> {
+    const bucket = this.snapshotsBucket();
+    if (bucket === null) {
+      return this.r2Misconfigured();
+    }
+    if (snapshot.type === "list") {
+      if (request.method === "GET") {
+        return this.listSnapshots();
+      }
+      return errorResponse(405, "method_not_allowed", "Method Not Allowed");
+    }
+    if (request.method === "GET") {
+      return await this.getSnapshot(bucket, snapshot.filename);
+    }
+    if (request.method === "PUT") {
+      return await this.putSnapshot(request, bucket, snapshot);
+    }
+    if (request.method === "DELETE") {
+      return await this.deleteSnapshot(request, bucket, snapshot.filename);
+    }
+    return errorResponse(405, "method_not_allowed", "Method Not Allowed");
+  }
+
+  private getSnapshotRow(filename: string): SnapshotRow | null {
+    const row = this.ctx.storage.sql.exec<SnapshotRow>(
+      `SELECT filename, etag, bytes, updated_at, r2_key
+       FROM snapshots WHERE filename = ?`,
+      filename,
+    ).toArray()[0];
+    return row ?? null;
+  }
+
+  private upsertSnapshotRow(
+    filename: string,
+    etag: string,
+    bytes: number,
+    updatedAt: string,
+    r2Key: string,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO snapshots (filename, etag, bytes, updated_at, r2_key)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(filename) DO UPDATE SET
+         etag = excluded.etag,
+         bytes = excluded.bytes,
+         updated_at = excluded.updated_at,
+         r2_key = excluded.r2_key`,
+      filename,
+      etag,
+      bytes,
+      updatedAt,
+      r2Key,
+    );
+  }
+
+  private listSnapshots(): Response {
+    if (this.loadVault() === null) {
+      return errorResponse(404, "not_found", "Not Found");
+    }
+    const rows = this.ctx.storage.sql.exec<SnapshotRow>(
+      `SELECT filename, etag, bytes, updated_at, r2_key
+       FROM snapshots ORDER BY filename`,
+    ).toArray();
+    const items: SnapshotListItem[] = rows.map((row) => ({
+      bytes: row.bytes,
+      etag: row.etag,
+      filename: row.filename,
+      updatedAt: row.updated_at,
+    }));
+    const document = {
+      items,
+      schema: SNAPSHOTS_SCHEMA,
+    };
+    return jsonResponse(sortKeys(document), 200, {
+      "X-Vibe-Prompt-Revision": String(this.objectRevision()),
+    });
+  }
+
+  private async getSnapshot(bucket: R2Bucket, filename: string): Promise<Response> {
+    const row = this.getSnapshotRow(filename);
+    if (row === null) {
+      return errorResponse(404, "not_found", "Not Found");
+    }
+    let object: R2ObjectBody | null;
+    try {
+      object = await bucket.get(row.r2_key);
+    } catch {
+      return this.r2Misconfigured();
+    }
+    if (object === null) {
+      return errorResponse(404, "not_found", "Not Found");
+    }
+    const headers = this.snapshotHeaders(row.etag);
+    headers.set("content-type", "application/octet-stream");
+    return new Response(object.body, { status: 200, headers });
+  }
+
+  private async putSnapshot(
+    request: Request,
+    bucket: R2Bucket,
+    snapshot: ParsedSnapshotItem,
+  ): Promise<Response> {
+    const vault = this.loadVault();
+    if (vault === null) {
+      return errorResponse(404, "not_found", "Not Found");
+    }
+    const current = this.getSnapshotRow(snapshot.filename);
+    const pre = evaluatePreconditions(
+      current !== null,
+      current?.etag ?? null,
+      null,
+      request,
+    );
+    if (pre.type === "error") {
+      return pre.response;
+    }
+
+    const upload = await this.snapshotUploadBody(request, vault.document.encryption);
+    if (upload.type === "error") {
+      return upload.response;
+    }
+
+    const r2Key = `${vault.document.vaultId}/${snapshot.filename}`;
+    let stored: R2Object | null;
+    try {
+      stored = await bucket.put(r2Key, upload.body);
+      if (upload.done !== null) {
+        await upload.done;
+      }
+    } catch {
+      if (upload.done !== null) {
+        await upload.done.catch(() => undefined);
+      }
+      return this.r2Misconfigured();
+    }
+    if (stored === null) {
+      return this.r2Misconfigured();
+    }
+
+    const now = formatCanonicalUtc();
+    const etag = this.snapshotEtag(stored);
+    this.upsertSnapshotRow(snapshot.filename, etag, stored.size, now, r2Key);
+    if (snapshot.kind === "auto") {
+      await this.gcAutoSnapshots(bucket, vault.document.snapshotRetention);
+    }
+    return new Response(null, {
+      status: pre.mode === "create" ? 201 : 204,
+      headers: this.snapshotHeaders(etag),
+    });
+  }
+
+  private async deleteSnapshot(
+    request: Request,
+    bucket: R2Bucket,
+    filename: string,
+  ): Promise<Response> {
+    const current = this.getSnapshotRow(filename);
+    const pre = evaluateIfMatch(
+      current !== null,
+      current?.etag ?? null,
+      null,
+      request,
+    );
+    if (pre.type === "error") {
+      return pre.response;
+    }
+    if (current === null) {
+      return errorResponse(404, "not_found", "Not Found");
+    }
+    try {
+      await bucket.delete(current.r2_key);
+    } catch {
+      return this.r2Misconfigured();
+    }
+    this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE filename = ?", filename);
+    return new Response(null, {
+      status: 204,
+      headers: this.snapshotHeaders(current.etag),
+    });
+  }
+
+  private async gcAutoSnapshots(
+    bucket: R2Bucket,
+    retention: VaultDocument["snapshotRetention"],
+  ): Promise<void> {
+    const autos = this.ctx.storage.sql.exec<SnapshotRow>(
+      `SELECT filename, etag, bytes, updated_at, r2_key FROM snapshots
+       WHERE filename LIKE 'vibe-prompt-auto_%'
+       ORDER BY filename ASC`,
+    ).toArray();
+    let count = autos.length;
+    let totalBytes = 0;
+    for (const row of autos) {
+      totalBytes += row.bytes;
+    }
+    for (const victim of autos) {
+      if (count <= retention.maxCount && totalBytes <= retention.maxBytes) {
+        break;
+      }
+      try {
+        await bucket.delete(victim.r2_key);
+      } catch {
+        // Unreferenced R2 keys may be ignored; SQL remains source of truth.
+      }
+      this.ctx.storage.sql.exec(
+        "DELETE FROM snapshots WHERE filename = ?",
+        victim.filename,
+      );
+      count -= 1;
+      totalBytes -= victim.bytes;
+    }
   }
 }
