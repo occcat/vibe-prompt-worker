@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import worker from "../src/index";
 
 const HEALTH_PATH = "https://worker.test/v1/health";
-const EXPECTED_CAPABILITIES = ["etag", "if-match", "index-atomic"];
+const EXPECTED_CAPABILITIES = ["etag", "if-match", "index-atomic", "batch-push"];
 
 function workerFetch(input: string, init?: RequestInit): Promise<Response> {
   return exports.default.fetch(input, init);
@@ -36,7 +36,7 @@ describe("bootstrap edge routes", () => {
       authConfigured: false,
     });
     expect(body.capabilities).not.toContain("batch");
-    expect(body.capabilities).not.toContain("batch-push");
+    expect(body.capabilities).toContain("batch-push");
   });
 
   it("GET /v1/health with AUTH_VALUE set reports authConfigured true", async () => {

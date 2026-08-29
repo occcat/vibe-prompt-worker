@@ -82,7 +82,7 @@ npm start
 
 `/v1/share*` 为预留路径。v1 不实现只读分享。
 
-health 的 `capabilities` 目前为 `etag`、`if-match`、`index-atomic`，不宣传批量上传。
+health 的 `capabilities` 目前为 `etag`、`if-match`、`index-atomic`、`batch-push`。不宣传无修饰的 `batch`。
 
 ## License
 

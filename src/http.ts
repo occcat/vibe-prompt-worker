@@ -12,7 +12,8 @@ export type ErrorCode =
   | "payload_too_large"
   | "index_too_large"
   | "method_not_allowed"
-  | "conflict";
+  | "conflict"
+  | "rate_limited";
 
 export function jsonResponse(
   data: unknown,
