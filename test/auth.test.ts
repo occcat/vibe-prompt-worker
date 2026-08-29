@@ -175,11 +175,75 @@ describe("X-Vibe-Prompt-Protocol", () => {
     }
     expectCors(response);
   });
+
+  it("GET /v1/vault with protocol 2 is 400 invalid_protocol", async () => {
+    await expectError(
+      await fetchConfigured(VAULT_URL, {
+        headers: await authHeaders({ [PROTOCOL_HEADER]: "2" }),
+      }),
+      400,
+      "invalid_protocol",
+      INVALID_PROTOCOL_MESSAGE,
+    );
+  });
+
+  it("GET /v1/vault with protocol 1 and correct Bearer is not invalid_protocol", async () => {
+    const response = await fetchConfigured(VAULT_URL, {
+      headers: await authHeaders({ [PROTOCOL_HEADER]: "1" }),
+    });
+    expect(response.status).not.toBe(400);
+    expectCors(response);
+  });
+
+  it("PUT /v1/vault without Authorization is 401 even with protocol 1", async () => {
+    await expectError(
+      await fetchConfigured(VAULT_URL, {
+        method: "PUT",
+        headers: { [PROTOCOL_HEADER]: "1" },
+      }),
+      401,
+      "unauthorized",
+      UNAUTHORIZED_MESSAGE,
+    );
+  });
+
+  it("PUT /v1/vault with the wrong Bearer is 403 even with protocol 1", async () => {
+    await expectError(
+      await fetchConfigured(VAULT_URL, {
+        method: "PUT",
+        headers: {
+          Authorization: "Bearer deadbeef",
+          [PROTOCOL_HEADER]: "1",
+        },
+      }),
+      403,
+      "forbidden",
+      FORBIDDEN_MESSAGE,
+    );
+  });
+
+  it("POST /v1/sync/push with correct Bearer and no protocol is 400", async () => {
+    await expectError(
+      await fetchConfigured("https://worker.test/v1/sync/push", {
+        method: "POST",
+        headers: await authHeaders(),
+      }),
+      400,
+      "invalid_protocol",
+      INVALID_PROTOCOL_MESSAGE,
+    );
+  });
 });
 
 describe("CORS", () => {
   it("OPTIONS /v1/vault is 204 with CORS allow headers and methods", async () => {
     const response = await exports.default.fetch(VAULT_URL, { method: "OPTIONS" });
+    expect(response.status).toBe(204);
+    expectCors(response);
+  });
+
+  it("OPTIONS /v1/vault is 204 without Authorization when AUTH_VALUE is set", async () => {
+    const response = await fetchConfigured(VAULT_URL, { method: "OPTIONS" });
     expect(response.status).toBe(204);
     expectCors(response);
   });
