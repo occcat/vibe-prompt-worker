@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   indexWouldExceedLimit,
+  isBatchPushTooLarge,
   isObjectPutTooLarge,
   isSnapshotPutTooLarge,
+  MAX_BATCH_CONTENT_LENGTH,
   MAX_INDEX_BYTES,
   MAX_INDEX_ITEMS,
   MAX_OBJECT_BYTES,
@@ -54,5 +56,22 @@ describe("isSnapshotPutTooLarge", () => {
       headers: { "Content-Length": String(MAX_SNAPSHOT_BYTES) },
     });
     expect(isSnapshotPutTooLarge(allowed)).toBe(false);
+  });
+});
+
+describe("isBatchPushTooLarge", () => {
+  it("rejects POST /v1/sync/push whose Content-Length exceeds 28 MiB", () => {
+    const url = "https://worker.test/v1/sync/push";
+    const large = new Request(url, {
+      method: "POST",
+      headers: { "Content-Length": String(MAX_BATCH_CONTENT_LENGTH + 1) },
+    });
+    expect(isBatchPushTooLarge(large)).toBe(true);
+
+    const allowed = new Request(url, {
+      method: "POST",
+      headers: { "Content-Length": String(MAX_BATCH_CONTENT_LENGTH) },
+    });
+    expect(isBatchPushTooLarge(allowed)).toBe(false);
   });
 });

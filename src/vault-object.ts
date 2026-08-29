@@ -9,7 +9,12 @@ import {
   quoteEtag,
   revisionHeaders,
 } from "./http";
-import { indexWouldExceedLimit, MAX_OBJECT_BYTES } from "./limits";
+import {
+  indexWouldExceedLimit,
+  MAX_BATCH_DECODED_BYTES,
+  MAX_BATCH_ITEMS,
+  MAX_OBJECT_BYTES,
+} from "./limits";
 import { hasVpbeMagic } from "./magic";
 import {
   parseObjectPath,
@@ -19,6 +24,13 @@ import {
   type ParsedSnapshotItem,
 } from "./paths";
 import { evaluateIfMatch, evaluatePreconditions } from "./preconditions";
+import { decodeBase64, parsePushItems, pushItemPath, type PushItem } from "./push";
+import {
+  parseRateWindow,
+  RATE_LIMIT_META_KEY,
+  serializeRateWindow,
+  tryConsumeObjects,
+} from "./rate-limit";
 import {
   parseTombstoneJson,
   parseVaultJson,
@@ -160,6 +172,13 @@ export class VaultObject extends DurableObject<Env> {
     if (pathname === "/v1/index") {
       if (request.method === "GET") {
         return this.getIndex(url);
+      }
+      return errorResponse(405, "method_not_allowed", "Method Not Allowed");
+    }
+
+    if (pathname === "/v1/sync/push") {
+      if (request.method === "POST") {
+        return await this.pushBatch(request);
       }
       return errorResponse(405, "method_not_allowed", "Method Not Allowed");
     }
@@ -454,6 +473,100 @@ export class VaultObject extends DurableObject<Env> {
       headers.set("content-type", "application/octet-stream");
     }
     return new Response(row.body, { status: 200, headers });
+  }
+
+  private async pushBatch(request: Request): Promise<Response> {
+    let parsed: unknown;
+    try {
+      parsed = await request.json();
+    } catch {
+      return errorResponse(400, "invalid_json", "Invalid JSON.");
+    }
+    const items = parsePushItems(parsed);
+    if (items === null) {
+      return errorResponse(400, "invalid_json", "Invalid JSON.");
+    }
+    if (items.length > MAX_BATCH_ITEMS) {
+      return errorResponse(413, "payload_too_large", "Payload too large.");
+    }
+
+    const decoded: Array<{ item: PushItem; body: Uint8Array }> = [];
+    let decodedBytes = 0;
+    for (const item of items) {
+      const body = decodeBase64(item.bodyBase64);
+      if (body === null) {
+        return errorResponse(400, "invalid_json", "Invalid JSON.");
+      }
+      decodedBytes += body.byteLength;
+      if (decodedBytes > MAX_BATCH_DECODED_BYTES) {
+        return errorResponse(413, "payload_too_large", "Payload too large.");
+      }
+      decoded.push({ item, body });
+    }
+
+    if (decoded.length > 0 && !this.consumeObjectQuota(decoded.length)) {
+      return errorResponse(429, "rate_limited", "Rate limited.");
+    }
+
+    const results: Array<Record<string, unknown>> = [];
+    for (const entry of decoded) {
+      results.push(await this.pushOne(entry.item, entry.body, request.url));
+    }
+    const revision = this.objectRevision();
+    return jsonResponse({ revision, results }, 200, revisionHeaders(revision));
+  }
+
+  private consumeObjectQuota(count: number): boolean {
+    const current = parseRateWindow(this.getMeta(RATE_LIMIT_META_KEY));
+    const result = tryConsumeObjects(current, count, Date.now());
+    this.setMeta(RATE_LIMIT_META_KEY, serializeRateWindow(result.window));
+    return result.ok;
+  }
+
+  private async pushOne(
+    item: PushItem,
+    body: Uint8Array,
+    baseUrl: string,
+  ): Promise<Record<string, unknown>> {
+    const pathname = pushItemPath(item);
+    const parsed = parseObjectPath(pathname);
+    if (!parsed.ok) {
+      return { id: item.id, status: 400 };
+    }
+    const headers = new Headers();
+    if (item.ifMatch !== null) {
+      headers.set("If-Match", item.ifMatch);
+    }
+    if (item.ifNoneMatch !== null) {
+      headers.set("If-None-Match", item.ifNoneMatch);
+    }
+    const inner = new Request(new URL(pathname, baseUrl), {
+      method: "PUT",
+      headers,
+      body,
+    });
+    return await this.pushResult(item.id, await this.putObject(inner, parsed.value));
+  }
+
+  private async pushResult(
+    id: string,
+    response: Response,
+  ): Promise<Record<string, unknown>> {
+    const status = response.status;
+    // Batch item success is 204 even when the inner PUT created with 201.
+    if (status === 201 || status === 204) {
+      const etag = response.headers.get("ETag");
+      if (etag === null) {
+        return { id, status: 204 };
+      }
+      return { id, status: 204, etag };
+    }
+    if (status === 409) {
+      const payload = await response.json() as { currentEtag?: string | null };
+      return { id, status, currentEtag: payload.currentEtag ?? null };
+    }
+    await response.body?.cancel();
+    return { id, status };
   }
 
   private async putObject(request: Request, path: ParsedObject): Promise<Response> {

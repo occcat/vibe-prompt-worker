@@ -10,6 +10,7 @@ export const VAULT_URL = "https://worker.test/v1/vault";
 export const INDEX_URL = "https://worker.test/v1/index";
 export const HEALTH_URL = "https://worker.test/v1/health";
 export const SNAPSHOTS_URL = "https://worker.test/v1/snapshots";
+export const PUSH_URL = "https://worker.test/v1/sync/push";
 export const VAULT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 export const KDF_SALT = "0123456789abcdef0123456789abcdef";
 export const PROMPT_ID = "11111111-2222-4333-8444-555555555555";
@@ -151,6 +152,51 @@ export async function putObject(
 export async function getObject(url: string): Promise<Response> {
   return fetchConfigured(url, { headers: await authHeaders() });
 }
+
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+export function pushItem(
+  kind: string,
+  id: string,
+  body: Uint8Array,
+  preconditions: { ifMatch?: string | null; ifNoneMatch?: string | null } = {},
+): Record<string, unknown> {
+  const ifMatch = typeof preconditions.ifMatch === "string" ? preconditions.ifMatch : null;
+  const ifNoneMatch = preconditions.ifNoneMatch === undefined
+    ? (ifMatch === null ? "*" : null)
+    : preconditions.ifNoneMatch;
+  return {
+    kind,
+    id,
+    ifMatch,
+    ifNoneMatch,
+    bodyBase64: bytesToBase64(body),
+  };
+}
+
+export async function pushObjects(items: unknown[]): Promise<Response> {
+  return fetchConfigured(PUSH_URL, {
+    method: "POST",
+    headers: await writeHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ items }),
+  });
+}
+
+export type PushResponse = {
+  revision: number;
+  results: Array<{
+    id: string;
+    status: number;
+    etag?: string;
+    currentEtag?: string | null;
+  }>;
+};
 
 export async function deleteObject(url: string, extra?: HeadersInit): Promise<Response> {
   return fetchConfigured(url, {

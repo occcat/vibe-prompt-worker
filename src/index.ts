@@ -1,13 +1,13 @@
 import { verifyAuthorization } from "./auth";
 import { errorResponse, jsonResponse } from "./http";
-import { isObjectPutTooLarge, isSnapshotPutTooLarge } from "./limits";
+import { isBatchPushTooLarge, isObjectPutTooLarge, isSnapshotPutTooLarge } from "./limits";
 import { isSnapshotRoute } from "./paths";
 
 export { VaultObject } from "./vault-object";
 
 const WORKER_NAME = "vibe-prompt-worker";
 const HEALTH_SCHEMA = "vibe-prompt.health/1";
-const HEALTH_CAPABILITIES = ["etag", "if-match", "index-atomic"] as const;
+const HEALTH_CAPABILITIES = ["etag", "if-match", "index-atomic", "batch-push"] as const;
 const PROTOCOL_HEADER = "X-Vibe-Prompt-Protocol";
 const PROTOCOL_VERSION = "1";
 const WRITE_METHODS = new Set(["DELETE", "PATCH", "POST", "PUT"]);
@@ -79,7 +79,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return errorResponse(400, "invalid_protocol", "X-Vibe-Prompt-Protocol must be 1.");
   }
 
-  if (isObjectPutTooLarge(request)) {
+  if (isObjectPutTooLarge(request) || isBatchPushTooLarge(request)) {
     return errorResponse(413, "payload_too_large", "Payload too large.");
   }
 

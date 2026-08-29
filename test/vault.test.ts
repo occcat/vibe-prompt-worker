@@ -129,12 +129,12 @@ describe("GET /v1/index and method restrictions", () => {
 });
 
 describe("health capabilities after object CRUD", () => {
-  it("does not advertise batch-push", async () => {
+  it("advertises batch-push and still omits bare batch", async () => {
     const response = await fetchConfigured(HEALTH_URL);
     expect(response.status).toBe(200);
     const body = await response.json() as { capabilities: string[] };
+    expect(body.capabilities).toContain("batch-push");
     expect(body.capabilities).not.toContain("batch");
-    expect(body.capabilities).not.toContain("batch-push");
   });
 
   it("GET /v1/health without AUTH_VALUE is still 200", async () => {

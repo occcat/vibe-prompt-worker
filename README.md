@@ -82,7 +82,7 @@ Encrypted objects are capped well below 2 MB. Snapshots go to R2 so they are not
 
 `/v1/share*` is reserved. v1 does not implement read-only sharing.
 
-Health `capabilities` currently include `etag`, `if-match`, and `index-atomic`. It does not advertise batch upload.
+Health `capabilities` currently include `etag`, `if-match`, `index-atomic`, and `batch-push`. It does not advertise a bare `batch` capability.
 
 ## License
 
