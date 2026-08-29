@@ -7,7 +7,11 @@ export class VaultObject extends DurableObject<Env> {
 }
 
 export default {
-  async fetch(): Promise<Response> {
+  async fetch(
+    _request: Request,
+    _env: Env,
+    _ctx: ExecutionContext,
+  ): Promise<Response> {
     return new Response("Not Implemented", { status: 501 });
   },
 } satisfies ExportedHandler<Env>;

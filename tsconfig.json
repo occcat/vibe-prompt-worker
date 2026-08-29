@@ -10,16 +10,17 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "types": [
-      "./worker-configuration.d.ts"
+      "./worker-configuration.d.ts",
+      "@cloudflare/vitest-pool-workers/types"
     ]
   },
   "include": [
     "src/**/*.ts",
+    "test/**/*.ts",
     "worker-configuration.d.ts"
   ],
   "exclude": [
     "node_modules",
-    "dist",
-    "test"
+    "dist"
   ]
 }

@@ -28,5 +28,8 @@
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.127.1"
+  },
+  "overrides": {
+    "miniflare": "5.20260828.0-alpha"
   }
 }
