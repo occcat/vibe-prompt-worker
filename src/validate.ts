@@ -1,9 +1,9 @@
 import { isCanonicalUtc } from "./canonical";
+import { isSingularKind, UUID_RE, type SingularKind } from "./kinds";
 
-export const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export { SCOPE_ID_RE, UUID_RE } from "./kinds";
+
 export const KDF_SALT_RE = /^[0-9a-f]{32}$/;
-export const SCOPE_ID_RE = /^[a-z0-9._-]+$/;
 
 export type VaultEncryption = "required" | "optional" | "forbidden";
 
@@ -22,7 +22,7 @@ export type VaultDocument = {
 
 export type TombstoneDocument = {
   schema: "vibe-prompt.tombstone/1";
-  targetKind: "prompt" | "label" | "scope";
+  targetKind: SingularKind;
   id: string;
   deletedAt: string;
 };
@@ -82,7 +82,7 @@ export function parseVaultJson(value: unknown): VaultDocument | null {
 
 export function parseTombstoneJson(
   value: unknown,
-  expected: { targetKind: string; id: string },
+  expected: { targetKind: SingularKind; id: string },
 ): TombstoneDocument | null {
   if (!isRecord(value)) {
     return null;
@@ -90,11 +90,7 @@ export function parseTombstoneJson(
   if (value.schema !== "vibe-prompt.tombstone/1") {
     return null;
   }
-  if (
-    value.targetKind !== "prompt" &&
-    value.targetKind !== "label" &&
-    value.targetKind !== "scope"
-  ) {
+  if (!isSingularKind(value.targetKind)) {
     return null;
   }
   if (value.targetKind !== expected.targetKind) {
