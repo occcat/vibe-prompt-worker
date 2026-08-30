@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   configuredEnv,
+  deleteSnapshot,
   fetchConfigured,
   fetchWithEnv,
   getIndex,
@@ -111,6 +112,43 @@ describe("R2 snapshots", () => {
     expect(names).toContain(snapshotFilename("auto", 31));
     expect((await getSnapshot(snapshotFilename("auto", 1))).status).toBe(404);
     expect((await getSnapshot(BACKUP_NAME)).status).toBe(200);
+  });
+
+  it("DELETE with If-Match is 204 and GET is 404", async () => {
+    const created = await putSnapshot(AUTO_NAME, vpbeBody());
+    expect(created.status).toBe(201);
+    const etag = created.headers.get("ETag");
+    expect(etag).toBeTruthy();
+
+    const deleted = await deleteSnapshot(AUTO_NAME, { "If-Match": etag! });
+    expect(deleted.status).toBe(204);
+    expect((await getSnapshot(AUTO_NAME)).status).toBe(404);
+
+    const listed = await (await getSnapshots()).json() as SnapshotListBody;
+    expect(listed.items.map((item) => item.filename)).not.toContain(AUTO_NAME);
+  });
+
+  it("DELETE without If-Match is 428", async () => {
+    expect((await putSnapshot(AUTO_NAME, vpbeBody())).status).toBe(201);
+    const response = await deleteSnapshot(AUTO_NAME);
+    expect(response.status).toBe(428);
+    const body = await response.json() as ErrorBody;
+    expect(body.error.code).toBe("precondition_required");
+    expect((await getSnapshot(AUTO_NAME)).status).toBe(200);
+  });
+
+  it("DELETE with a stale If-Match is 409", async () => {
+    const created = await putSnapshot(AUTO_NAME, vpbeBody());
+    expect(created.status).toBe(201);
+    const etag = created.headers.get("ETag");
+    expect(etag).toBeTruthy();
+
+    const stale = await deleteSnapshot(AUTO_NAME, { "If-Match": '"stale"' });
+    expect(stale.status).toBe(409);
+    const body = await stale.json() as ErrorBody;
+    expect(body.error.code).toBe("conflict");
+    expect(body.currentEtag).toBe(etag);
+    expect((await getSnapshot(AUTO_NAME)).status).toBe(200);
   });
 
   it("missing SNAPSHOTS binding is 503 for snapshot PUT but object PUT still 204", async () => {

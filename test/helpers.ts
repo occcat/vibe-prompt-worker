@@ -243,6 +243,16 @@ export async function getSnapshot(filename: string): Promise<Response> {
   return fetchConfigured(snapshotUrl(filename), { headers: await authHeaders() });
 }
 
+export async function deleteSnapshot(
+  filename: string,
+  extra?: HeadersInit,
+): Promise<Response> {
+  return fetchConfigured(snapshotUrl(filename), {
+    method: "DELETE",
+    headers: await writeHeaders(extra),
+  });
+}
+
 export type SnapshotListBody = {
   schema: string;
   items: Array<{
