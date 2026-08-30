@@ -47,12 +47,15 @@ const SNAPSHOTS_SCHEMA = "vibe-prompt.snapshots/1";
 const ZERO_TIME = "1970-01-01T00:00:00.000Z";
 const SNAPSHOTS_MISCONFIGURED = "Must bind SNAPSHOTS R2 bucket.";
 
-type BlobRow = {
+type MetaRow = {
   path: string;
   etag: string;
   revision: number;
   bytes: number;
   updated_at: string;
+};
+
+type BlobRow = MetaRow & {
   body: ArrayBuffer;
 };
 
@@ -301,13 +304,13 @@ export class VaultObject extends DurableObject<Env> {
     return emptyRevisionResponse(status, revision);
   }
 
-  private readBlobs(): BlobRow[] {
-    return this.ctx.storage.sql.exec<BlobRow>(
-      "SELECT path, etag, revision, bytes, updated_at, body FROM blobs",
+  private readBlobs(): MetaRow[] {
+    return this.ctx.storage.sql.exec<MetaRow>(
+      "SELECT path, etag, revision, bytes, updated_at FROM blobs",
     ).toArray();
   }
 
-  private blobToItem(row: BlobRow): IndexItem | null {
+  private blobToItem(row: MetaRow): IndexItem | null {
     const prompt = /^objects\/prompts\/([^/]+)\.vpb$/.exec(row.path);
     if (prompt?.[1] !== undefined) {
       return this.liveItem("prompt", prompt[1], row);
@@ -336,7 +339,7 @@ export class VaultObject extends DurableObject<Env> {
     return null;
   }
 
-  private liveItem(kind: "prompt" | "label" | "scope", id: string, row: BlobRow): IndexItem {
+  private liveItem(kind: "prompt" | "label" | "scope", id: string, row: MetaRow): IndexItem {
     return {
       bytes: row.bytes,
       deleted: false,
