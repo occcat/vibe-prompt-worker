@@ -9,6 +9,7 @@ import {
   quoteEtag,
   revisionHeaders,
 } from "./http";
+import { classifyBlobPath, type SingularKind } from "./kinds";
 import {
   indexWouldExceedLimit,
   MAX_BATCH_DECODED_BYTES,
@@ -59,7 +60,7 @@ type BlobRow = MetaRow & {
   body: ArrayBuffer;
 };
 
-type IndexKind = "prompt" | "label" | "scope" | "tombstone";
+type IndexKind = SingularKind | "tombstone";
 
 type IndexItem = {
   bytes: number;
@@ -310,35 +311,25 @@ export class VaultObject extends DurableObject<Env> {
   }
 
   private blobToItem(row: MetaRow): IndexItem | null {
-    const prompt = /^objects\/prompts\/([^/]+)\.vpb$/.exec(row.path);
-    if (prompt?.[1] !== undefined) {
-      return this.liveItem("prompt", prompt[1], row);
+    const classified = classifyBlobPath(row.path);
+    if (classified === null) {
+      return null;
     }
-    const label = /^objects\/labels\/([^/]+)\.vpb$/.exec(row.path);
-    if (label?.[1] !== undefined) {
-      return this.liveItem("label", label[1], row);
+    if (classified.type === "live") {
+      return this.liveItem(classified.singular, classified.id, row);
     }
-    const scope = /^objects\/scopes\/([^/]+)\.vpb$/.exec(row.path);
-    if (scope?.[1] !== undefined) {
-      return this.liveItem("scope", scope[1], row);
-    }
-    const tombstone =
-      /^objects\/tombstones\/(prompt|label|scope)\/([^/]+)\.json$/.exec(row.path);
-    if (tombstone?.[1] !== undefined && tombstone[2] !== undefined) {
-      return {
-        bytes: row.bytes,
-        deleted: true,
-        etag: row.etag,
-        id: `${tombstone[1]}:${tombstone[2]}`,
-        kind: "tombstone",
-        revision: row.revision,
-        updatedAt: row.updated_at,
-      };
-    }
-    return null;
+    return {
+      bytes: row.bytes,
+      deleted: true,
+      etag: row.etag,
+      id: `${classified.targetKind}:${classified.id}`,
+      kind: "tombstone",
+      revision: row.revision,
+      updatedAt: row.updated_at,
+    };
   }
 
-  private liveItem(kind: "prompt" | "label" | "scope", id: string, row: MetaRow): IndexItem {
+  private liveItem(kind: SingularKind, id: string, row: MetaRow): IndexItem {
     return {
       bytes: row.bytes,
       deleted: false,

@@ -2,13 +2,16 @@ import {
   isLiveId,
   isLiveUrlKind,
   isSingularKind,
+  liveBlobPath,
   LIVE_KINDS,
   SINGULAR_TO_URL,
+  tombstoneBlobPath,
   type LiveUrlKind,
   type SingularKind,
 } from "./kinds";
 
 export type { LiveUrlKind, SingularKind };
+export { liveBlobPath, tombstoneBlobPath };
 
 export type ParsedLiveObject = {
   type: "live";
@@ -56,14 +59,6 @@ export type ParseSnapshotPathResult =
 
 const SNAPSHOT_FILENAME_RE =
   /^vibe-prompt-(auto|backup)_(\d{8}T\d{6}Z)_([0-9a-f]{8})_([0-9a-f]{6})\.vpb$/;
-
-export function liveBlobPath(urlKind: LiveUrlKind, id: string): string {
-  return `objects/${urlKind}/${id}.vpb`;
-}
-
-export function tombstoneBlobPath(kind: SingularKind, id: string): string {
-  return `objects/tombstones/${kind}/${id}.json`;
-}
 
 function hasNonAscii(value: string): boolean {
   for (let i = 0; i < value.length; i++) {

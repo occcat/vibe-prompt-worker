@@ -49,3 +49,58 @@ export function isLiveId(urlKind: LiveUrlKind, id: string): boolean {
   const spec = LIVE_KIND_SPECS.find((item) => item.url === urlKind);
   return spec !== undefined && spec.idPattern.test(id);
 }
+
+export function liveBlobPath(urlKind: LiveUrlKind, id: string): string {
+  return `objects/${urlKind}/${id}.vpb`;
+}
+
+export function tombstoneBlobPath(kind: SingularKind, id: string): string {
+  return `objects/tombstones/${kind}/${id}.json`;
+}
+
+export type ClassifiedLiveBlob = {
+  type: "live";
+  urlKind: LiveUrlKind;
+  singular: SingularKind;
+  id: string;
+};
+
+export type ClassifiedTombstoneBlob = {
+  type: "tombstone";
+  targetKind: SingularKind;
+  id: string;
+};
+
+export type ClassifiedBlobPath = ClassifiedLiveBlob | ClassifiedTombstoneBlob;
+
+const LIVE_BLOB_PATH_RE = new RegExp(
+  `^objects/(${LIVE_URL_KINDS.join("|")})/([^/]+)\\.vpb$`,
+);
+const TOMBSTONE_BLOB_PATH_RE = new RegExp(
+  `^objects/tombstones/(${SINGULAR_KINDS.join("|")})/([^/]+)\\.json$`,
+);
+
+export function classifyBlobPath(path: string): ClassifiedBlobPath | null {
+  const live = LIVE_BLOB_PATH_RE.exec(path);
+  const urlKind = live?.[1];
+  const liveId = live?.[2];
+  if (isLiveUrlKind(urlKind) && liveId !== undefined) {
+    return {
+      type: "live",
+      urlKind,
+      singular: LIVE_KINDS[urlKind],
+      id: liveId,
+    };
+  }
+  const tombstone = TOMBSTONE_BLOB_PATH_RE.exec(path);
+  const targetKind = tombstone?.[1];
+  const tombstoneId = tombstone?.[2];
+  if (isSingularKind(targetKind) && tombstoneId !== undefined) {
+    return {
+      type: "tombstone",
+      targetKind,
+      id: tombstoneId,
+    };
+  }
+  return null;
+}
