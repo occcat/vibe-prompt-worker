@@ -1,19 +1,14 @@
-import { SCOPE_ID_RE, UUID_RE } from "./validate";
+import {
+  isLiveId,
+  isLiveUrlKind,
+  isSingularKind,
+  LIVE_KINDS,
+  SINGULAR_TO_URL,
+  type LiveUrlKind,
+  type SingularKind,
+} from "./kinds";
 
-export type LiveUrlKind = "prompts" | "labels" | "scopes";
-export type SingularKind = "prompt" | "label" | "scope";
-
-const LIVE_KINDS: Record<LiveUrlKind, SingularKind> = {
-  prompts: "prompt",
-  labels: "label",
-  scopes: "scope",
-};
-
-const SINGULAR_TO_URL: Record<SingularKind, LiveUrlKind> = {
-  prompt: "prompts",
-  label: "labels",
-  scope: "scopes",
-};
+export type { LiveUrlKind, SingularKind };
 
 export type ParsedLiveObject = {
   type: "live";
@@ -79,13 +74,6 @@ function hasNonAscii(value: string): boolean {
   return false;
 }
 
-function isLiveId(urlKind: LiveUrlKind, id: string): boolean {
-  if (urlKind === "scopes") {
-    return SCOPE_ID_RE.test(id);
-  }
-  return UUID_RE.test(id);
-}
-
 function liveObject(urlKind: LiveUrlKind, id: string): ParsedLiveObject {
   const indexKind = LIVE_KINDS[urlKind];
   return {
@@ -133,7 +121,7 @@ export function parseObjectPath(pathname: string): ParseObjectPathResult {
   if (id === "") {
     return { ok: false, reason: "invalid_path" };
   }
-  if (urlKind === "prompts" || urlKind === "labels" || urlKind === "scopes") {
+  if (isLiveUrlKind(urlKind)) {
     if (!isLiveId(urlKind, id)) {
       return { ok: false, reason: "invalid_path" };
     }
@@ -146,11 +134,7 @@ export function parseObjectPath(pathname: string): ParseObjectPathResult {
     }
     const targetKind = id.slice(0, colon);
     const targetId = id.slice(colon + 1);
-    if (
-      targetKind !== "prompt" &&
-      targetKind !== "label" &&
-      targetKind !== "scope"
-    ) {
+    if (!isSingularKind(targetKind)) {
       return { ok: false, reason: "invalid_path" };
     }
     const liveKind = SINGULAR_TO_URL[targetKind];

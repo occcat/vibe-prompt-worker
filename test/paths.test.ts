@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { LIVE_KIND_SPECS } from "../src/kinds";
 import { parseObjectPath, parseSnapshotPath } from "../src/paths";
 import { PROMPT_ID, snapshotFilename } from "./helpers";
 
@@ -45,6 +46,34 @@ describe("parseObjectPath", () => {
       ok: false,
       reason: "invalid_path",
     });
+  });
+
+  it("accepts every registry live kind and matching tombstone path", () => {
+    for (const spec of LIVE_KIND_SPECS) {
+      const id = spec.singular === "scope" ? "team.scope-1" : PROMPT_ID;
+      const live = parseObjectPath(`/v1/objects/${spec.url}/${id}`);
+      expect(live).toMatchObject({
+        ok: true,
+        value: {
+          type: "live",
+          urlKind: spec.url,
+          indexKind: spec.singular,
+          id,
+        },
+      });
+      const tombstone = parseObjectPath(
+        `/v1/objects/tombstones/${spec.singular}:${id}`,
+      );
+      expect(tombstone).toMatchObject({
+        ok: true,
+        value: {
+          type: "tombstone",
+          targetKind: spec.singular,
+          liveUrlKind: spec.url,
+          id,
+        },
+      });
+    }
   });
 });
 
