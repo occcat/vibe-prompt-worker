@@ -47,12 +47,15 @@ const SNAPSHOTS_SCHEMA = "vibe-prompt.snapshots/1";
 const ZERO_TIME = "1970-01-01T00:00:00.000Z";
 const SNAPSHOTS_MISCONFIGURED = "Must bind SNAPSHOTS R2 bucket.";
 
-type BlobRow = {
+type MetaRow = {
   path: string;
   etag: string;
   revision: number;
   bytes: number;
   updated_at: string;
+};
+
+type BlobRow = MetaRow & {
   body: ArrayBuffer;
 };
 
@@ -123,7 +126,7 @@ export class VaultObject extends DurableObject<Env> {
         revision INTEGER NOT NULL,
         bytes INTEGER NOT NULL,
         updated_at TEXT NOT NULL,
-        body BLOB NOT NULL CHECK (length(body) <= 1500000)
+        body BLOB NOT NULL CHECK (length(body) <= ${MAX_OBJECT_BYTES})
       )
     `);
     this.ctx.storage.sql.exec(`
@@ -145,7 +148,6 @@ export class VaultObject extends DurableObject<Env> {
 
   private async handleRequest(request: Request): Promise<Response> {
     try {
-      this.initSchema();
       return await this.route(request);
     } catch (error) {
       if (error instanceof SyntaxError) {
@@ -301,13 +303,13 @@ export class VaultObject extends DurableObject<Env> {
     return emptyRevisionResponse(status, revision);
   }
 
-  private readBlobs(): BlobRow[] {
-    return this.ctx.storage.sql.exec<BlobRow>(
-      "SELECT path, etag, revision, bytes, updated_at, body FROM blobs",
+  private readBlobs(): MetaRow[] {
+    return this.ctx.storage.sql.exec<MetaRow>(
+      "SELECT path, etag, revision, bytes, updated_at FROM blobs",
     ).toArray();
   }
 
-  private blobToItem(row: BlobRow): IndexItem | null {
+  private blobToItem(row: MetaRow): IndexItem | null {
     const prompt = /^objects\/prompts\/([^/]+)\.vpb$/.exec(row.path);
     if (prompt?.[1] !== undefined) {
       return this.liveItem("prompt", prompt[1], row);
@@ -336,7 +338,7 @@ export class VaultObject extends DurableObject<Env> {
     return null;
   }
 
-  private liveItem(kind: "prompt" | "label" | "scope", id: string, row: BlobRow): IndexItem {
+  private liveItem(kind: "prompt" | "label" | "scope", id: string, row: MetaRow): IndexItem {
     return {
       bytes: row.bytes,
       deleted: false,
@@ -387,6 +389,14 @@ export class VaultObject extends DurableObject<Env> {
       items: index.items.filter((item) => item.revision > sinceRevision),
     };
     return jsonResponse(sortKeys(filtered), 200, revisionHeaders(index.revision));
+  }
+
+  private getBlobMeta(path: string): MetaRow | null {
+    const row = this.ctx.storage.sql.exec<MetaRow>(
+      "SELECT path, etag, revision, bytes, updated_at FROM blobs WHERE path = ?",
+      path,
+    ).toArray()[0];
+    return row ?? null;
   }
 
   private getBlob(path: string): BlobRow | null {
@@ -580,7 +590,7 @@ export class VaultObject extends DurableObject<Env> {
     request: Request,
     path: Extract<ParsedObject, { type: "live" }>,
   ): Promise<Response> {
-    const current = this.getBlob(path.blobPath);
+    const current = this.getBlobMeta(path.blobPath);
     const pre = evaluatePreconditions(
       current !== null,
       current?.etag ?? null,
@@ -629,7 +639,7 @@ export class VaultObject extends DurableObject<Env> {
     request: Request,
     path: Extract<ParsedObject, { type: "tombstone" }>,
   ): Promise<Response> {
-    const current = this.getBlob(path.blobPath);
+    const current = this.getBlobMeta(path.blobPath);
     const pre = evaluatePreconditions(
       current !== null,
       current?.etag ?? null,
@@ -695,7 +705,7 @@ export class VaultObject extends DurableObject<Env> {
     request: Request,
     path: Extract<ParsedObject, { type: "live" }>,
   ): Response {
-    const current = this.getBlob(path.blobPath);
+    const current = this.getBlobMeta(path.blobPath);
     const pre = evaluateIfMatch(
       current !== null,
       current?.etag ?? null,
@@ -742,7 +752,7 @@ export class VaultObject extends DurableObject<Env> {
     request: Request,
     path: Extract<ParsedObject, { type: "tombstone" }>,
   ): Response {
-    const current = this.getBlob(path.blobPath);
+    const current = this.getBlobMeta(path.blobPath);
     const pre = evaluateIfMatch(
       current !== null,
       current?.etag ?? null,
