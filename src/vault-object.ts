@@ -79,6 +79,14 @@ type IndexDocument = {
   updatedAt: string;
 };
 
+type ObjectWriteCommit = {
+  dropIds: string[];
+  nextItem: IndexItem | null;
+  upsert: { path: string; body: ArrayBuffer } | null;
+  deletePath: string | null;
+  status: number;
+};
+
 type SnapshotRow = {
   filename: string;
   etag: string;
@@ -570,6 +578,29 @@ export class VaultObject extends DurableObject<Env> {
     return { id, status };
   }
 
+  private commitObjectWrite(args: ObjectWriteCommit): Response {
+    if (
+      args.nextItem !== null &&
+      this.wouldExceedIndex(args.dropIds, args.nextItem)
+    ) {
+      return errorResponse(507, "index_too_large", "Index too large.");
+    }
+    const now = args.nextItem?.updatedAt ?? formatCanonicalUtc();
+    const revision = args.nextItem?.revision ?? this.objectRevision() + 1;
+    const etag = args.nextItem?.etag ?? quoteEtag(revision);
+    this.ctx.storage.transactionSync(() => {
+      if (args.upsert !== null) {
+        this.upsertBlob(args.upsert.path, etag, revision, args.upsert.body, now);
+      }
+      if (args.deletePath !== null) {
+        this.deleteBlob(args.deletePath);
+      }
+      this.setMeta(META_OBJECT_REVISION, String(revision));
+      this.setMeta(META_INDEX_UPDATED_AT, now);
+    });
+    return emptyRevisionResponse(args.status, revision);
+  }
+
   private async putObject(request: Request, path: ParsedObject): Promise<Response> {
     if (path.type === "tombstone") {
       return await this.putTombstone(request, path);
@@ -604,26 +635,21 @@ export class VaultObject extends DurableObject<Env> {
     const now = formatCanonicalUtc();
     const revision = this.objectRevision() + 1;
     const etag = quoteEtag(revision);
-    const nextItem: IndexItem = {
-      bytes: buffer.byteLength,
-      deleted: false,
-      etag,
-      id: path.id,
-      kind: path.indexKind,
-      revision,
-      updatedAt: now,
-    };
-    if (this.wouldExceedIndex([path.id, path.tombstoneIndexId], nextItem)) {
-      return errorResponse(507, "index_too_large", "Index too large.");
-    }
-
-    this.ctx.storage.transactionSync(() => {
-      this.upsertBlob(path.blobPath, etag, revision, buffer, now);
-      this.deleteBlob(path.tombstoneBlobPath);
-      this.setMeta(META_OBJECT_REVISION, String(revision));
-      this.setMeta(META_INDEX_UPDATED_AT, now);
+    return this.commitObjectWrite({
+      dropIds: [path.id, path.tombstoneIndexId],
+      nextItem: {
+        bytes: buffer.byteLength,
+        deleted: false,
+        etag,
+        id: path.id,
+        kind: path.indexKind,
+        revision,
+        updatedAt: now,
+      },
+      upsert: { path: path.blobPath, body: buffer },
+      deletePath: path.tombstoneBlobPath,
+      status: pre.mode === "create" ? 201 : 204,
     });
-    return emptyRevisionResponse(pre.mode === "create" ? 201 : 204, revision);
   }
 
   private async putTombstone(
@@ -663,26 +689,21 @@ export class VaultObject extends DurableObject<Env> {
     const now = formatCanonicalUtc();
     const revision = this.objectRevision() + 1;
     const etag = quoteEtag(revision);
-    const nextItem: IndexItem = {
-      bytes: body.byteLength,
-      deleted: true,
-      etag,
-      id: path.indexId,
-      kind: "tombstone",
-      revision,
-      updatedAt: now,
-    };
-    if (this.wouldExceedIndex([path.id, path.indexId], nextItem)) {
-      return errorResponse(507, "index_too_large", "Index too large.");
-    }
-
-    this.ctx.storage.transactionSync(() => {
-      this.upsertBlob(path.blobPath, etag, revision, body, now);
-      this.deleteBlob(path.liveBlobPath);
-      this.setMeta(META_OBJECT_REVISION, String(revision));
-      this.setMeta(META_INDEX_UPDATED_AT, now);
+    return this.commitObjectWrite({
+      dropIds: [path.id, path.indexId],
+      nextItem: {
+        bytes: body.byteLength,
+        deleted: true,
+        etag,
+        id: path.indexId,
+        kind: "tombstone",
+        revision,
+        updatedAt: now,
+      },
+      upsert: { path: path.blobPath, body },
+      deletePath: path.liveBlobPath,
+      status: pre.mode === "create" ? 201 : 204,
     });
-    return emptyRevisionResponse(pre.mode === "create" ? 201 : 204, revision);
   }
 
   private deleteObject(request: Request, path: ParsedObject): Response {
@@ -717,26 +738,21 @@ export class VaultObject extends DurableObject<Env> {
       deletedAt: now,
     };
     const body = this.utf8Bytes(canonicalJson(document));
-    const nextItem: IndexItem = {
-      bytes: body.byteLength,
-      deleted: true,
-      etag,
-      id: path.tombstoneIndexId,
-      kind: "tombstone",
-      revision,
-      updatedAt: now,
-    };
-    if (this.wouldExceedIndex([path.id, path.tombstoneIndexId], nextItem)) {
-      return errorResponse(507, "index_too_large", "Index too large.");
-    }
-
-    this.ctx.storage.transactionSync(() => {
-      this.deleteBlob(path.blobPath);
-      this.upsertBlob(path.tombstoneBlobPath, etag, revision, body, now);
-      this.setMeta(META_OBJECT_REVISION, String(revision));
-      this.setMeta(META_INDEX_UPDATED_AT, now);
+    return this.commitObjectWrite({
+      dropIds: [path.id, path.tombstoneIndexId],
+      nextItem: {
+        bytes: body.byteLength,
+        deleted: true,
+        etag,
+        id: path.tombstoneIndexId,
+        kind: "tombstone",
+        revision,
+        updatedAt: now,
+      },
+      upsert: { path: path.tombstoneBlobPath, body },
+      deletePath: path.blobPath,
+      status: 204,
     });
-    return emptyRevisionResponse(204, revision);
   }
 
   private deleteTombstone(
@@ -754,14 +770,13 @@ export class VaultObject extends DurableObject<Env> {
       return pre.response;
     }
 
-    const now = formatCanonicalUtc();
-    const revision = this.objectRevision() + 1;
-    this.ctx.storage.transactionSync(() => {
-      this.deleteBlob(path.blobPath);
-      this.setMeta(META_OBJECT_REVISION, String(revision));
-      this.setMeta(META_INDEX_UPDATED_AT, now);
+    return this.commitObjectWrite({
+      dropIds: [],
+      nextItem: null,
+      upsert: null,
+      deletePath: path.blobPath,
+      status: 204,
     });
-    return emptyRevisionResponse(204, revision);
   }
 
   private snapshotsBucket(): R2Bucket | null {
