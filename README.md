@@ -2,7 +2,7 @@
 
 # vibe-prompt-worker
 
-**Self-hosted remote vault for vibe-prompt. The Worker never decrypts.**
+**Cloudflare Worker for a self-hosted vibe-prompt remote vault.**
 
 <p>
   <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/occcat/vibe-prompt-worker"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" /></a>
@@ -18,17 +18,13 @@ English | [简体中文](README.zh-CN.md)
 
 </div>
 
-vibe-prompt-worker is a [Cloudflare Worker](https://developers.cloudflare.com/workers/) you deploy for your own vibe-prompt vault. Incremental ciphertext lives in one Durable Object (SQLite). Snapshots live in R2. The Worker checks magic bytes and never decrypts content.
-
-Nextcloud / WebDAV is a **client** backend you configure in the vibe-prompt apps, not in this repository. This Worker is the recommended multi-device backend. It does not speak WebDAV and is not a Nextcloud app.
+vibe-prompt-worker is a [Cloudflare Worker](https://developers.cloudflare.com/workers/) you deploy for your own vibe-prompt vault. Incremental ciphertext lives in one Durable Object (SQLite). Snapshots live in R2.
 
 One deployment is one vault. A second vault needs a second Worker and a different R2 `bucket_name` or Cloudflare account.
 
 ## Quick Start
 
 ### 1. Deploy
-
-Pick whichever fits your flow.
 
 **1.1 Deploy to Cloudflare**
 
@@ -75,58 +71,26 @@ If it is `false`, add a **runtime** Secret named `AUTH_VALUE` under Worker Setti
 
 Paste the Worker URL into the vibe-prompt app as the remote vault. Use the same `AUTH_VALUE` as the sync password. Keep `vaultPassword` in the app only.
 
-Never paste `AUTH_VALUE`, `vaultPassword`, Cloudflare API tokens, ciphertext, or a personal Worker URL into issues, pull requests, or chat.
-
-## Highlights
-
-| Feature | What it does |
-| --- | --- |
-| **The Worker never decrypts** | Remote objects and snapshots are `VPBE` ciphertext. The Worker only checks the first four bytes (magic). `vaultPassword` stays on the device. |
-| **One deployment, one vault** | Incremental ciphertext lives in one Durable Object (SQLite). Snapshots go to R2 so they are not stored as SQLite BLOBs. |
-| **Native vibe-prompt protocol** | Health advertises `etag`, `if-match`, `index-atomic`, and `batch-push`. Writes require `X-Vibe-Prompt-Protocol: 1` and `If-Match` or `If-None-Match`. |
-| **Deploy with a button or Wrangler** | The Cloudflare Deploy button provisions the Worker, Durable Object, and R2 bucket. CLI deploy is `npm run deploy` plus `npm run secret`. |
-| **Sync password is not the content password** | `AUTH_VALUE` is a Worker runtime Secret. `vaultPassword` never reaches the Worker. Do not reuse one as the other, and do not paste a Cloudflare API token into either field. |
-
-## vs Nextcloud / WebDAV
-
-Most vibe-prompt setups can store files somewhere. The real questions are whether the backend speaks the native protocol, whether the host ever sees plaintext, and whether you can deploy it without running a file server.
-
-| Capability | vibe-prompt-worker | Nextcloud / WebDAV |
-| --- | :---: | :---: |
-| Native vibe-prompt protocol (`etag`, `if-match`, `batch-push`) | ✓ | — |
-| Host never decrypts content | ✓ | — |
-| One-click Cloudflare deploy | ✓ | — |
-| Incremental objects in a Durable Object | ✓ | — |
-| Snapshots outside the 2 MB SQL row limit | ✓ | files |
-| WebDAV | — | ✓ |
-| Configured in this repository | ✓ | — (in the apps) |
-| Read-only sharing in v1 | — | depends |
-
-Nextcloud / WebDAV remains available in the apps. This Worker does not replace that client backend and does not speak WebDAV.
+See [SECURITY.md](SECURITY.md) for what must not appear in issues, pull requests, or chat.
 
 ## AUTH_VALUE vs vaultPassword
 
 | Name | Stored | Purpose |
 | --- | --- | --- |
 | `AUTH_VALUE` | Worker **runtime Secret** | Sync password the client uses to reach this Worker. It is **not** a Cloudflare API Token, and it is **not** `CLOUDFLARE_API_TOKEN`. |
-| `vaultPassword` | Client only | Content password. The app encrypts remote objects and snapshots as `VPBE` before upload. The Worker never receives this password and never decrypts. |
+| `vaultPassword` | Client only | Content password. The app encrypts remote objects and snapshots before upload. |
 
 Clients send `Authorization: Bearer` where the token is the lowercase hex of
 `SHA-256(UTF-8(AUTH_VALUE) || UTF-8("vibe-prompt-worker-v1"))`.
-Writes also send `X-Vibe-Prompt-Protocol: 1`.
+Writes send `X-Vibe-Prompt-Protocol: 1`.
 
 ## Encryption
 
-The Worker only checks the first four bytes (magic). It never decrypts.
+When vault `encryption` is `required`, the Worker checks that live objects and snapshots start with the four-byte `VPBE` magic. `optional` and `forbidden` skip that check. If the vault document is missing, a live object PUT treats encryption as `required`.
 
-| Artifact | Default | Password | Magic | Who enforces |
-| --- | --- | --- | --- | --- |
-| Local auto backup (in the apps) | Unencrypted | none | `VPBP` | Apps only; this Worker is not involved |
-| Remote incremental objects | Encrypted | `vaultPassword` + vault `kdfSalt` | `VPBE` | Worker rejects non-`VPBE` when `encryption=required` |
-| Remote snapshots | Encrypted | `vaultPassword` (per-file random salt) | `VPBE` | Worker rejects non-`VPBE` when `encryption=required` |
-| Tombstone JSON | Metadata only | — | none | Plain JSON; no template body |
+Vault JSON (`vibe-prompt.vault/1`) must set `snapshotRetention.maxCount` to `30` and `maxBytes` to `629145600`. `encryption` is `required`, `optional`, or `forbidden`. `vaultId` and `kdfSalt` cannot change after create.
 
-Default vault `encryption` is `required`. Local automatic backups stay `VPBP` and are not stored by this Worker.
+Tombstones are JSON (`vibe-prompt.tombstone/1`), not `VPBE`.
 
 Snapshot objects in R2 use keys `{vaultId}/{filename}`. Do not point two deployments at the same bucket. Change `r2_buckets[0].bucket_name` in `wrangler.jsonc` or use another Cloudflare account.
 
@@ -147,11 +111,21 @@ Encrypted objects are capped at 1,500,000 bytes, well below the 2 MB row limit. 
 
 ## HTTP API
 
-`/v1/share*` is reserved. v1 returns **404** `not_found` (except `OPTIONS` → 204). Read-only sharing is not implemented. Those routes do not check `AUTH_VALUE` and do not enter the Durable Object.
+All responses include `Access-Control-Allow-Origin: *`.
 
-Health `capabilities` are `etag`, `if-match`, `index-atomic`, and `batch-push`. The Worker does **not** advertise a bare `batch` capability.
+Health JSON uses schema `vibe-prompt.health/1`. `capabilities` are `etag`, `if-match`, `index-atomic`, and `batch-push` (not `batch`). `authConfigured` follows whether `AUTH_VALUE` is set.
 
-`POST /v1/sync/push` is limited to **600 objects/min** (object count, not HTTP requests; no burst). Over the limit the whole batch returns 429 `rate_limited`. There is no 60 writes/min cap.
+A missing `X-Vibe-Prompt-Protocol` header is 400 `invalid_protocol` only for `PUT` / `POST` / `DELETE` / `PATCH`. If the header is present and not `1`, GET also returns 400.
+
+Unset `AUTH_VALUE` on vault routes is 503 `misconfigured` (`Must set AUTH_VALUE environment.`). Missing `Authorization: Bearer` is 401 `unauthorized` (`Missing Authorization bearer token.`). Invalid Bearer is 403 `forbidden` (`Sorry, you have supplied an invalid key.`).
+
+PUT on vault, objects, and snapshots requires `If-Match` or `If-None-Match` (428 `precondition_required` if neither). DELETE requires `If-Match` only. `POST /v1/sync/push` does not require those headers on the POST; each item carries `ifMatch` / `ifNoneMatch`.
+
+Snapshot filenames must match `vibe-prompt-(auto|backup)_YYYYMMDDTHHMMSSZ_<8hex>_<6hex>.vpb` or the request is 400 `invalid_path`. Putting the 31st `auto_` snapshot GCs the oldest `auto_` so 30 autos remain; `backup_` snapshots are kept.
+
+`POST /v1/sync/push` is limited to **600 objects/min** (object count, not HTTP requests; no burst). Over the limit the whole batch returns 429 `rate_limited`. Single PUT/DELETE is not rate-limited.
+
+Live object PUT is 413 `payload_too_large` at **1,500,000** bytes. Snapshot PUT is 413 at **20 MiB** Worker-edge `Content-Length` only. Batch push is 413 at **28 MiB** `Content-Length`, **100** items, or **20 MiB** decoded. Index over 8000 items or 4 MiB canonical JSON is 507 `index_too_large`. Missing R2 binding makes snapshot routes 503; incremental objects still work.
 
 ### Unauthenticated
 
@@ -160,17 +134,16 @@ Health `capabilities` are `etag`, `if-match`, `index-atomic`, and `batch-push`. 
 | `GET /` | `text/plain` body `vibe-prompt-worker` |
 | `GET /v1/health` | JSON health; `authConfigured` follows whether `AUTH_VALUE` is set |
 | `OPTIONS` (any path) | `204` |
-| Other methods on `/v1/share` and `/v1/share/{token}` | `404` JSON `not_found` |
-| Any other route without `AUTH_VALUE` | `503` JSON `misconfigured` / `Must set AUTH_VALUE environment.` |
+| `/v1/share` and `/v1/share/{token}` (except `OPTIONS`) | `404` JSON `not_found` (no `AUTH_VALUE` check, no Durable Object) |
+| Any other vault route without `AUTH_VALUE` | `503` JSON `misconfigured` / `Must set AUTH_VALUE environment.` |
 
 ### Authenticated (Bearer required)
-
-Writes (`PUT` / `POST` / `DELETE`) need `X-Vibe-Prompt-Protocol: 1` and `If-Match` or `If-None-Match`.
 
 | Request | Result |
 | --- | --- |
 | `GET` / `PUT /v1/vault` | Vault JSON (`vibe-prompt.vault/1`) |
 | `GET /v1/index` | Index JSON; optional `?sinceRevision=` |
+| `PUT /v1/index` | `405` `method_not_allowed` |
 | `GET` / `PUT` / `DELETE /v1/objects/prompts/{uuid}` | Live VPBE prompt |
 | `GET` / `PUT` / `DELETE /v1/objects/labels/{uuid}` | Live VPBE label |
 | `GET` / `PUT` / `DELETE /v1/objects/scopes/{id}` | Live VPBE scope |
@@ -178,17 +151,7 @@ Writes (`PUT` / `POST` / `DELETE`) need `X-Vibe-Prompt-Protocol: 1` and `If-Matc
 | `GET /v1/snapshots` | Snapshot list |
 | `GET` / `PUT` / `DELETE /v1/snapshots/{filename}` | Snapshot body in R2 (does not bump `objectRevision`) |
 | `POST /v1/sync/push` | Batch object PUT; partial 409 is valid |
-
-Missing `AUTH_VALUE` on these routes is 503, not 401.
-
-### Not in v1
-
-- `PUT /v1/index` → 405 (`putIndex` is WebDAV-only in the apps)
-- `POST /v1/sync/pull` → 404
-- Read-only sharing under `/v1/share*` → 404
-- Identity-preserving restore
-
-Live object PUT is rejected at **1,500,000** bytes (413). Snapshot PUT at **20 MiB**. Batch push at **28 MiB** `Content-Length`, **100** items, or **20 MiB** decoded. Index over 8000 items or 4 MiB → 507. Missing R2 binding → snapshot routes 503; incremental objects still work.
+| `POST /v1/sync/pull` | `404` `not_found` after auth |
 
 ## Community
 

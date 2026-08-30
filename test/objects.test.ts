@@ -193,6 +193,19 @@ describe("live prompt VPBE objects", () => {
   });
 });
 
+describe("optional encryption live objects", () => {
+  it("PUT non-VPBE live object succeeds when vault encryption is optional", async () => {
+    expect((await putVault(vaultDocument({ encryption: "optional" }))).status).toBe(201);
+    const payload = vpbpBody();
+    const created = await putObject(LIVE_URL, payload);
+    expect([201, 204]).toContain(created.status);
+
+    const got = await getObject(LIVE_URL);
+    expect(got.status).toBe(200);
+    expect(new Uint8Array(await got.arrayBuffer())).toEqual(payload);
+  });
+});
+
 describe("index item limit", () => {
   it("PUT of the 8001st object returns 507 after SQL seed of 8000", async () => {
     const stub = env.VAULT.get(env.VAULT.idFromName("vault"));

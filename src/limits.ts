@@ -1,3 +1,5 @@
+import { liveObjectPutPathRe } from "./kinds";
+
 export const MAX_OBJECT_BYTES = 1_500_000;
 export const MAX_SNAPSHOT_BYTES = 20 * 1024 * 1024;
 export const MAX_INDEX_ITEMS = 8000;
@@ -6,7 +8,6 @@ export const MAX_BATCH_ITEMS = 100;
 export const MAX_BATCH_DECODED_BYTES = 20 * 1024 * 1024;
 export const MAX_BATCH_CONTENT_LENGTH = 28 * 1024 * 1024;
 
-const LIVE_OBJECT_PUT = /^\/v1\/objects\/(prompts|labels|scopes)\//;
 const SNAPSHOT_ITEM_PUT = /^\/v1\/snapshots\//;
 
 export function indexWouldExceedLimit(
@@ -21,7 +22,7 @@ export function isObjectPutTooLarge(request: Request): boolean {
     return false;
   }
   const pathname = new URL(request.url).pathname;
-  if (!LIVE_OBJECT_PUT.test(pathname)) {
+  if (!liveObjectPutPathRe.test(pathname)) {
     return false;
   }
   const raw = request.headers.get("Content-Length");

@@ -1,4 +1,6 @@
-export type PushKind = "prompt" | "label" | "scope" | "tombstone";
+import { isSingularKind, SINGULAR_TO_URL, type SingularKind } from "./kinds";
+
+export type PushKind = SingularKind | "tombstone";
 
 export type PushItem = {
   kind: PushKind;
@@ -13,12 +15,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isPushKind(value: unknown): value is PushKind {
-  return (
-    value === "prompt" ||
-    value === "label" ||
-    value === "scope" ||
-    value === "tombstone"
-  );
+  return value === "tombstone" || isSingularKind(value);
 }
 
 function optionalHeader(value: unknown): string | null | false {
@@ -70,17 +67,11 @@ export function parsePushItems(value: unknown): PushItem[] | null {
   return items;
 }
 
-const URL_KIND: Record<Exclude<PushKind, "tombstone">, string> = {
-  prompt: "prompts",
-  label: "labels",
-  scope: "scopes",
-};
-
 export function pushItemPath(item: PushItem): string {
   if (item.kind === "tombstone") {
     return `/v1/objects/tombstones/${item.id}`;
   }
-  return `/v1/objects/${URL_KIND[item.kind]}/${item.id}`;
+  return `/v1/objects/${SINGULAR_TO_URL[item.kind]}/${item.id}`;
 }
 
 export function decodeBase64(value: string): Uint8Array | null {

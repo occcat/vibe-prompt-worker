@@ -1,19 +1,17 @@
-import { SCOPE_ID_RE, UUID_RE } from "./validate";
+import {
+  isLiveId,
+  isLiveUrlKind,
+  isSingularKind,
+  liveBlobPath,
+  LIVE_KINDS,
+  SINGULAR_TO_URL,
+  tombstoneBlobPath,
+  type LiveUrlKind,
+  type SingularKind,
+} from "./kinds";
 
-export type LiveUrlKind = "prompts" | "labels" | "scopes";
-export type SingularKind = "prompt" | "label" | "scope";
-
-const LIVE_KINDS: Record<LiveUrlKind, SingularKind> = {
-  prompts: "prompt",
-  labels: "label",
-  scopes: "scope",
-};
-
-const SINGULAR_TO_URL: Record<SingularKind, LiveUrlKind> = {
-  prompt: "prompts",
-  label: "labels",
-  scope: "scopes",
-};
+export type { LiveUrlKind, SingularKind };
+export { liveBlobPath, tombstoneBlobPath };
 
 export type ParsedLiveObject = {
   type: "live";
@@ -62,14 +60,6 @@ export type ParseSnapshotPathResult =
 const SNAPSHOT_FILENAME_RE =
   /^vibe-prompt-(auto|backup)_(\d{8}T\d{6}Z)_([0-9a-f]{8})_([0-9a-f]{6})\.vpb$/;
 
-export function liveBlobPath(urlKind: LiveUrlKind, id: string): string {
-  return `objects/${urlKind}/${id}.vpb`;
-}
-
-export function tombstoneBlobPath(kind: SingularKind, id: string): string {
-  return `objects/tombstones/${kind}/${id}.json`;
-}
-
 function hasNonAscii(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
     if (value.charCodeAt(i) > 127) {
@@ -77,13 +67,6 @@ function hasNonAscii(value: string): boolean {
     }
   }
   return false;
-}
-
-function isLiveId(urlKind: LiveUrlKind, id: string): boolean {
-  if (urlKind === "scopes") {
-    return SCOPE_ID_RE.test(id);
-  }
-  return UUID_RE.test(id);
 }
 
 function liveObject(urlKind: LiveUrlKind, id: string): ParsedLiveObject {
@@ -133,7 +116,7 @@ export function parseObjectPath(pathname: string): ParseObjectPathResult {
   if (id === "") {
     return { ok: false, reason: "invalid_path" };
   }
-  if (urlKind === "prompts" || urlKind === "labels" || urlKind === "scopes") {
+  if (isLiveUrlKind(urlKind)) {
     if (!isLiveId(urlKind, id)) {
       return { ok: false, reason: "invalid_path" };
     }
@@ -146,11 +129,7 @@ export function parseObjectPath(pathname: string): ParseObjectPathResult {
     }
     const targetKind = id.slice(0, colon);
     const targetId = id.slice(colon + 1);
-    if (
-      targetKind !== "prompt" &&
-      targetKind !== "label" &&
-      targetKind !== "scope"
-    ) {
+    if (!isSingularKind(targetKind)) {
       return { ok: false, reason: "invalid_path" };
     }
     const liveKind = SINGULAR_TO_URL[targetKind];
