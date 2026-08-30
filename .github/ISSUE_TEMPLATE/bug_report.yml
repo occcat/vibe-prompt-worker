@@ -11,8 +11,6 @@ body:
 
         For security vulnerabilities, use a [private security advisory](https://github.com/occcat/vibe-prompt-worker/security/advisories/new) instead.
 
-        Never paste `AUTH_VALUE`, `vaultPassword`, Cloudflare API tokens, account IDs, ciphertext, or personal Worker URLs.
-
   - type: dropdown
     id: component
     attributes:
