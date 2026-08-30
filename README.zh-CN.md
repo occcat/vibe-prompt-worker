@@ -190,12 +190,6 @@ health 的 `capabilities` 为 `etag`、`if-match`、`index-atomic`、`batch-push
 
 活对象 PUT 超过 **1,500,000** 字节返回 413。Snapshot PUT 超过 **20 MiB** 返回 413。batch-push 的 `Content-Length` 超过 **28 MiB**、超过 **100** 条或解码后超过 **20 MiB** 返回 413。index 超过 8000 条或 4 MiB 返回 507。缺少 R2 绑定时仅 snapshot 路由 503，增量对象仍可用。
 
-## CI
-
-GitHub Actions 在 pull request 以及向 `main` / `thoxvi/**` 的 push 上用 Node 22 运行 `npm ci`、`npm test` 和 `npx tsc --noEmit`。只有仓库同时配置了 `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID` 这两个 secret 时才会执行 `npx wrangler deploy`。缺任一 secret 则跳过部署，工作流仍成功。
-
-这两个 secret 是 Wrangler 用的 Cloudflare 凭证，**不是** `AUTH_VALUE`。不要把它们的值写进仓库、issue 或 pull request。
-
 ## 社区
 
 - [GitHub Issues](https://github.com/occcat/vibe-prompt-worker/issues)，缺陷和具体需求

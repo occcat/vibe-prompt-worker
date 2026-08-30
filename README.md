@@ -190,12 +190,6 @@ Missing `AUTH_VALUE` on these routes is 503, not 401.
 
 Live object PUT is rejected at **1,500,000** bytes (413). Snapshot PUT at **20 MiB**. Batch push at **28 MiB** `Content-Length`, **100** items, or **20 MiB** decoded. Index over 8000 items or 4 MiB → 507. Missing R2 binding → snapshot routes 503; incremental objects still work.
 
-## CI
-
-GitHub Actions runs `npm ci`, `npm test`, and `npx tsc --noEmit` on pull requests and on pushes to `main` and `thoxvi/**` (Node 22). `npx wrangler deploy` runs only when both `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets are set. If either is absent, deploy is skipped and the job still succeeds.
-
-Those secrets are Cloudflare credentials for Wrangler, **not** `AUTH_VALUE`. Do not put their values in this repository, in issues, or in pull requests.
-
 ## Community
 
 - [GitHub Issues](https://github.com/occcat/vibe-prompt-worker/issues), bugs and concrete requests
