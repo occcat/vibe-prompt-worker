@@ -10,13 +10,7 @@ Issues and pull requests are welcome. Coding and commit rules for this repositor
 
 ## Secrets
 
-Never commit, paste, or screenshot:
-
-- `AUTH_VALUE`
-- `vaultPassword`
-- Cloudflare API tokens or account IDs
-- `.dev.vars`
-- vault ciphertext, snapshots, or personal Worker URLs
+Do not commit, paste, or screenshot secrets. The never-include list is in [SECURITY.md](SECURITY.md).
 
 `.dev.vars` is gitignored. Copy `.dev.vars.example` for local development and keep the real file off git.
 
