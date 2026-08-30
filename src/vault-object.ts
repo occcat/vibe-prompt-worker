@@ -126,7 +126,7 @@ export class VaultObject extends DurableObject<Env> {
         revision INTEGER NOT NULL,
         bytes INTEGER NOT NULL,
         updated_at TEXT NOT NULL,
-        body BLOB NOT NULL CHECK (length(body) <= 1500000)
+        body BLOB NOT NULL CHECK (length(body) <= ${MAX_OBJECT_BYTES})
       )
     `);
     this.ctx.storage.sql.exec(`
@@ -148,7 +148,6 @@ export class VaultObject extends DurableObject<Env> {
 
   private async handleRequest(request: Request): Promise<Response> {
     try {
-      this.initSchema();
       return await this.route(request);
     } catch (error) {
       if (error instanceof SyntaxError) {
