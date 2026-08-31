@@ -61,7 +61,8 @@ describe("snapshot-only bootstrap routes", () => {
     expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(response.headers.get("Access-Control-Allow-Methods"))
       .toBe("GET, PUT, DELETE, OPTIONS, HEAD");
-    expect(response.headers.get("Access-Control-Expose-Headers")).toBe("ETag");
+    expect(response.headers.get("Access-Control-Expose-Headers"))
+      .toBe("ETag, X-Vibe-Prompt-Manifest-ETag");
     expect(response.headers.get("Access-Control-Allow-Headers"))
       .not.toContain("X-Vibe-Prompt-Device-Id");
   });

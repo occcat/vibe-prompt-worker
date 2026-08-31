@@ -9,8 +9,9 @@
 </div>
 
 The Worker authenticates clients and stores complete encrypted `VPBE` snapshots in Cloudflare
-R2. R2 is the only data store. There is no object-level sync database, Durable Object, dirty set,
-tombstone, index, or batch push API.
+R2. R2 is the only data store. A single `manifest.json` atomically owns the visible snapshot
+catalog and current head; snapshot bodies remain immutable objects. There is no object-level sync
+database, Durable Object, dirty set, tombstone, index, or batch push API.
 
 One deployment represents one remote vault. Use a separate deployment and R2 bucket for another
 vault.
@@ -91,15 +92,17 @@ Upload requirements:
 - `VPBE` as the first four bytes
 - no more than 20 MiB, including requests without `Content-Length`
 
-An existing name returns `412 precondition_failed`; it is never overwritten. The list schema is
-`vibe-prompt.snapshots/2`, with `name`, `size`, `createdAt`, `etag`, and `isHead` for each item.
+An existing name returns `412 precondition_failed`; it is never overwritten. A successful upload
+returns the body ETag in `ETag` and the new control revision in
+`X-Vibe-Prompt-Manifest-ETag`. The list schema is `vibe-prompt.snapshots/2`, with `name`, `size`,
+`createdAt`, `etag`, and `isHead` for each item.
 
 Deletion requires `If-Match` with the quoted ETag returned by the service. A stale ETag returns
 `412`. Deleting the snapshot currently referenced by head returns `409 snapshot_is_head`.
 
 ### Current head
 
-`GET /v2/head` returns the current pointer and its R2 ETag:
+`GET /v2/head` returns the current pointer and the control manifest ETag:
 
 ```json
 {
@@ -110,9 +113,19 @@ Deletion requires `If-Match` with the quoted ETag returned by the service. A sta
 ```
 
 Create it with `PUT /v2/head` and `If-None-Match: *`. Update it with the latest `If-Match` ETag.
-The request uses `Content-Type: application/json` and contains the same schema plus `snapshot`;
-the server supplies `updatedAt`. The referenced snapshot must already exist. A racing or stale
-write returns `412`, so clients can refetch instead of silently overwriting another device.
+The ETag identifies the entire manifest revision, so uploading or deleting any snapshot also makes
+an older head ETag stale. After uploading a snapshot, use its
+`X-Vibe-Prompt-Manifest-ETag` response value for the following head `If-Match`. The request uses
+`Content-Type: application/json` and contains the same schema plus `snapshot`; the server supplies
+`updatedAt`. The referenced snapshot must already be in the same manifest. A racing or stale write
+returns `412`, so clients can refetch instead of silently overwriting another device.
+
+Snapshot upload writes the immutable body before registering it through manifest CAS. If CAS loses
+a race, the unregistered body stays invisible to list, head, and download. Retrying the identical
+upload reuses that body and registers it; different bytes under the same filename are rejected.
+Deletion first removes a non-head member through manifest CAS and then performs physical cleanup.
+A cleanup failure stays logically deleted and is retried by later requests. Deleted filenames stay
+retired, preventing a cleanup race from deleting a newly uploaded body under the same name.
 
 ## Development
 

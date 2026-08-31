@@ -6,6 +6,7 @@ export type ErrorCode =
   | "invalid_protocol"
   | "invalid_path"
   | "invalid_json"
+  | "invalid_body"
   | "invalid_magic"
   | "invalid_content_type"
   | "invalid_storage"
@@ -14,6 +15,8 @@ export type ErrorCode =
   | "payload_too_large"
   | "method_not_allowed"
   | "snapshot_is_head"
+  | "snapshot_deleting"
+  | "snapshot_deleted"
   | "snapshot_not_found"
   | "storage_unavailable";
 

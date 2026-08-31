@@ -9,8 +9,9 @@
 </div>
 
 Worker 负责客户端鉴权，并把完整的加密 `VPBE` 快照存入 Cloudflare R2。
-R2 是唯一数据源，不再存在对象级同步数据库、Durable Object、dirty set、
-tombstone、索引或批量推送 API。
+R2 是唯一数据源。单一 `manifest.json` 原子管理可见快照目录与当前 head，
+快照正文保持为不可变对象。不再存在对象级同步数据库、Durable Object、
+dirty set、tombstone、索引或批量推送 API。
 
 一个部署代表一个远端保险库。第二套保险库应使用另一套部署和 R2 桶。
 
@@ -91,15 +92,18 @@ vibe-prompt-(auto|backup)_YYYYMMDDTHHMMSSZ_<8 位小写十六进制>_<6 位小�
 - 前四个字节为 `VPBE`
 - 不超过 20 MiB；没有 `Content-Length` 时也会校验真实正文大小
 
-同名快照已存在时返回 `412 precondition_failed`，绝不覆盖。列表 schema 为
-`vibe-prompt.snapshots/2`，每项包含 `name`、`size`、`createdAt`、`etag` 和 `isHead`。
+同名快照已存在时返回 `412 precondition_failed`，绝不覆盖。
+上传成功后，`ETag` 返回正文 ETag，
+`X-Vibe-Prompt-Manifest-ETag` 返回新的控制版本。
+列表 schema 为 `vibe-prompt.snapshots/2`，每项包含 `name`、`size`、`createdAt`、
+`etag` 和 `isHead`。
 
 删除必须使用服务返回的带引号 ETag 作为 `If-Match`。
 过期 ETag 返回 `412`；删除当前 head 指向的快照返回 `409 snapshot_is_head`。
 
 ### 当前 head
 
-`GET /v2/head` 返回当前指针及其 R2 ETag：
+`GET /v2/head` 返回当前指针及控制 manifest 的 ETag：
 
 ```json
 {
@@ -110,9 +114,20 @@ vibe-prompt-(auto|backup)_YYYYMMDDTHHMMSSZ_<8 位小写十六进制>_<6 位小�
 ```
 
 首次 `PUT /v2/head` 使用 `If-None-Match: *`，之后更新必须使用最新 `If-Match` ETag。
-请求媒体类型为 `application/json`，正文包含相同 schema 和 `snapshot`；
-服务端生成 `updatedAt`。目标快照必须已经存在。并发或过期写返回 `412`，
+ETag 标识整个 manifest 版本，
+因此上传或删除任何快照也会让旧 head ETag 过期。
+上传快照后，紧接的 head `If-Match` 必须使用响应里的
+`X-Vibe-Prompt-Manifest-ETag`。请求媒体类型为 `application/json`，
+正文包含相同 schema 和 `snapshot`；服务端生成 `updatedAt`。
+目标快照必须已在同一 manifest 中。并发或过期写返回 `412`，
 客户端应重新获取状态，避免静默覆盖其他设备。
+
+上传先写不可变正文，再用 manifest CAS 注册。
+CAS 竞争失败时，未注册正文不会出现在列表、head 或下载接口中；
+相同正文重试会复用它并完成注册，同名不同正文会被拒绝。
+删除先用 manifest CAS 移除非 head 成员，再清理物理正文。
+清理失败时仍保持逻辑删除，后续请求会继续重试清理。
+已删除文件名会永久停用，避免清理竞态误删同名新正文。
 
 ## 开发
 

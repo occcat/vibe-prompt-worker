@@ -1,8 +1,9 @@
 import { errorResponse, jsonResponse } from "./http";
 import { hasVpbeMagic } from "./magic";
 
-const HEAD_KEY = "head.json";
 const HEAD_SCHEMA = "vibe-prompt.head/2";
+const MANIFEST_KEY = "manifest.json";
+const MANIFEST_SCHEMA = "vibe-prompt.manifest/2";
 const SNAPSHOT_CONTENT_TYPE = "application/octet-stream";
 const SNAPSHOT_PREFIX = "snapshots/";
 const SNAPSHOTS_SCHEMA = "vibe-prompt.snapshots/2";
@@ -23,13 +24,43 @@ type HeadInput = {
   snapshot: string;
 };
 
+type ManifestItem = {
+  name: string;
+  size: number;
+  createdAt: string;
+  etag: string;
+};
+
+type ManifestDocument = {
+  schema: typeof MANIFEST_SCHEMA;
+  head: HeadDocument | null;
+  snapshots: ManifestItem[];
+  pendingDeletes: string[];
+  retiredSnapshots: string[];
+};
+
+type ManifestState = {
+  document: ManifestDocument;
+  etag: string | null;
+};
+
+type ManifestLoadResult =
+  | { type: "ok"; state: ManifestState }
+  | { type: "error"; response: Response };
+
 type SnapshotRoute =
   | { type: "list" }
   | { type: "item"; filename: string };
 
 type ReadBodyResult =
   | { type: "ok"; body: Uint8Array }
-  | { type: "too_large" };
+  | { type: "too_large" }
+  | { type: "error" };
+
+type BodyStoreResult =
+  | { type: "ok"; object: R2Object }
+  | { type: "conflict" }
+  | { type: "error"; response: Response };
 
 export async function routeSnapshotApi(
   request: Request,
@@ -77,27 +108,18 @@ async function routeHead(request: Request, bucket: R2Bucket): Promise<Response> 
 }
 
 async function getHead(bucket: R2Bucket): Promise<Response> {
-  let object: R2ObjectBody | null;
-  try {
-    object = await bucket.get(HEAD_KEY);
-  } catch {
-    return storageUnavailable();
+  const loaded = await loadAndCleanManifest(bucket);
+  if (loaded.type === "error") {
+    return loaded.response;
   }
-  if (object === null) {
+  const { head } = loaded.state.document;
+  if (head === null) {
     return errorResponse(404, "not_found", "Not Found");
   }
-  const document = await parseStoredHead(object);
-  if (document === null) {
-    return errorResponse(500, "invalid_storage", "Stored head is invalid.");
-  }
-  return jsonResponse(document, 200, { ETag: httpEtag(object) });
+  return jsonResponse(head, 200, manifestEtagHeaders(loaded.state));
 }
 
 async function putHead(request: Request, bucket: R2Bucket): Promise<Response> {
-  const condition = headWriteCondition(request);
-  if (condition === null) {
-    return preconditionRequired();
-  }
   if (!hasContentType(request, "application/json")) {
     return errorResponse(
       415,
@@ -109,89 +131,88 @@ async function putHead(request: Request, bucket: R2Bucket): Promise<Response> {
   if (read.type === "too_large") {
     return errorResponse(413, "payload_too_large", "Payload too large.");
   }
+  if (read.type === "error") {
+    return invalidBody();
+  }
   const input = parseHeadInput(read.body);
   if (input === null) {
     return errorResponse(400, "invalid_json", "Invalid JSON.");
   }
 
-  let snapshot: R2Object | null;
-  try {
-    snapshot = await bucket.head(snapshotKey(input.snapshot));
-  } catch {
-    return storageUnavailable();
+  const loaded = await loadAndCleanManifest(bucket);
+  if (loaded.type === "error") {
+    return loaded.response;
   }
-  if (snapshot === null) {
+  const precondition = evaluateHeadPrecondition(request, loaded.state);
+  if (precondition.type === "error") {
+    return precondition.response;
+  }
+  if (!loaded.state.document.snapshots.some((item) => item.name === input.snapshot)) {
     return errorResponse(404, "snapshot_not_found", "Snapshot not found.");
   }
 
-  const document: HeadDocument = {
+  const head: HeadDocument = {
     schema: HEAD_SCHEMA,
     snapshot: input.snapshot,
     updatedAt: new Date().toISOString(),
   };
-  let stored: R2Object | null;
-  try {
-    stored = await bucket.put(HEAD_KEY, JSON.stringify(document), {
-      onlyIf: condition.headers,
-      httpMetadata: { contentType: "application/json" },
-    });
-  } catch {
-    return storageUnavailable();
+  const next: ManifestDocument = { ...loaded.state.document, head };
+  const stored = await storeManifest(bucket, loaded.state, next);
+  if (stored.type === "error") {
+    return stored.response;
   }
-  if (stored === null) {
-    return errorResponse(412, "precondition_failed", "Precondition failed.");
+  if (stored.type === "conflict") {
+    return preconditionFailed();
   }
-  return jsonResponse(document, condition.create ? 201 : 200, {
-    ETag: httpEtag(stored),
+  return jsonResponse(head, precondition.create ? 201 : 200, {
+    ETag: httpEtag(stored.object),
   });
 }
 
 async function listSnapshots(bucket: R2Bucket): Promise<Response> {
-  let objects: R2Object[];
-  try {
-    objects = await listAll(bucket, SNAPSHOT_PREFIX);
-  } catch {
-    return storageUnavailable();
+  const loaded = await loadAndCleanManifest(bucket);
+  if (loaded.type === "error") {
+    return loaded.response;
   }
-  const head = await loadHead(bucket);
-  if (head.type === "error") {
-    return head.response;
-  }
-  objects.sort((left, right) => {
-    const byDate = right.uploaded.getTime() - left.uploaded.getTime();
-    return byDate === 0 ? right.key.localeCompare(left.key) : byDate;
-  });
-  return jsonResponse({
-    schema: SNAPSHOTS_SCHEMA,
-    items: objects.map((object) => {
-      const name = object.key.slice(SNAPSHOT_PREFIX.length);
-      return {
-        name,
-        size: object.size,
-        createdAt: object.uploaded.toISOString(),
-        etag: httpEtag(object),
-        isHead: head.document?.snapshot === name,
-      };
-    }),
-  });
+  const { document } = loaded.state;
+  const items = [...document.snapshots]
+    .sort(compareManifestItems)
+    .map((item) => ({
+      ...item,
+      isHead: document.head?.snapshot === item.name,
+    }));
+  return jsonResponse(
+    { schema: SNAPSHOTS_SCHEMA, items },
+    200,
+    manifestEtagHeaders(loaded.state),
+  );
 }
 
 async function getSnapshot(bucket: R2Bucket, filename: string): Promise<Response> {
+  const loaded = await loadAndCleanManifest(bucket);
+  if (loaded.type === "error") {
+    return loaded.response;
+  }
+  const item = loaded.state.document.snapshots.find((candidate) => candidate.name === filename);
+  if (item === undefined) {
+    return errorResponse(404, "not_found", "Not Found");
+  }
+
   let object: R2ObjectBody | null;
   try {
     object = await bucket.get(snapshotKey(filename));
   } catch {
     return storageUnavailable();
   }
-  if (object === null) {
-    return errorResponse(404, "not_found", "Not Found");
+  if (object === null || httpEtag(object) !== item.etag || object.size !== item.size) {
+    return errorResponse(500, "invalid_storage", "Stored snapshot is invalid.");
   }
   return new Response(object.body, {
     status: 200,
     headers: {
-      "Content-Length": String(object.size),
+      "Content-Length": String(item.size),
       "Content-Type": SNAPSHOT_CONTENT_TYPE,
-      ETag: httpEtag(object),
+      ETag: item.etag,
     },
   });
 }
@@ -222,23 +243,58 @@ async function putSnapshot(
   if (read.type === "too_large") {
     return errorResponse(413, "payload_too_large", "Payload too large.");
   }
+  if (read.type === "error") {
+    return invalidBody();
+  }
   if (!hasVpbeMagic(read.body)) {
     return errorResponse(400, "invalid_magic", "Invalid magic.");
   }
 
-  let stored: R2Object | null;
-  try {
-    stored = await bucket.put(snapshotKey(filename), read.body, {
-      onlyIf: new Headers({ "If-None-Match": "*" }),
-      httpMetadata: { contentType: SNAPSHOT_CONTENT_TYPE },
-    });
-  } catch {
-    return storageUnavailable();
+  const loaded = await loadAndCleanManifest(bucket);
+  if (loaded.type === "error") {
+    return loaded.response;
   }
-  if (stored === null) {
-    return errorResponse(412, "precondition_failed", "Precondition failed.");
+  if (loaded.state.document.snapshots.some((item) => item.name === filename)) {
+    return preconditionFailed();
   }
-  return new Response(null, { status: 201, headers: { ETag: httpEtag(stored) } });
+  if (loaded.state.document.pendingDeletes.includes(filename)) {
+    return errorResponse(409, "snapshot_deleting", "Snapshot deletion is pending.");
+  }
+  if (loaded.state.document.retiredSnapshots.includes(filename)) {
+    return errorResponse(409, "snapshot_deleted", "Snapshot filename is retired.");
+  }
+
+  const body = await storeOrReuseBody(bucket, filename, read.body);
+  if (body.type === "error") {
+    return body.response;
+  }
+  if (body.type === "conflict") {
+    return preconditionFailed();
+  }
+  const item: ManifestItem = {
+    name: filename,
+    size: body.object.size,
+    createdAt: body.object.uploaded.toISOString(),
+    etag: httpEtag(body.object),
+  };
+  const next: ManifestDocument = {
+    ...loaded.state.document,
+    snapshots: [...loaded.state.document.snapshots, item],
+  };
+  const stored = await storeManifest(bucket, loaded.state, next);
+  if (stored.type === "error") {
+    return stored.response;
+  }
+  if (stored.type === "conflict") {
+    return preconditionFailed();
+  }
+  return new Response(null, {
+    status: 201,
+    headers: {
+      ETag: item.etag,
+      "X-Vibe-Prompt-Manifest-ETag": httpEtag(stored.object),
+    },
+  });
 }
 
 async function deleteSnapshot(
@@ -250,34 +306,159 @@ async function deleteSnapshot(
   if (ifMatch === null || ifMatch === "") {
     return preconditionRequired();
   }
-
-  let object: R2Object | null;
-  try {
-    object = await bucket.head(snapshotKey(filename));
-  } catch {
-    return storageUnavailable();
+  const loaded = await loadAndCleanManifest(bucket);
+  if (loaded.type === "error") {
+    return loaded.response;
   }
-  if (object === null) {
+  const item = loaded.state.document.snapshots.find((candidate) => candidate.name === filename);
+  if (item === undefined) {
     return errorResponse(404, "not_found", "Not Found");
   }
-  if (httpEtag(object) !== ifMatch) {
-    return errorResponse(412, "precondition_failed", "Precondition failed.");
+  if (item.etag !== ifMatch) {
+    return preconditionFailed();
   }
-
-  const head = await loadHead(bucket);
-  if (head.type === "error") {
-    return head.response;
-  }
-  if (head.document?.snapshot === filename) {
+  if (loaded.state.document.head?.snapshot === filename) {
     return errorResponse(409, "snapshot_is_head", "Current snapshot cannot be deleted.");
   }
 
+  const next: ManifestDocument = {
+    ...loaded.state.document,
+    snapshots: loaded.state.document.snapshots.filter(
+      (candidate) => candidate.name !== filename,
+    ),
+    pendingDeletes: [...loaded.state.document.pendingDeletes, filename],
+    retiredSnapshots: [...loaded.state.document.retiredSnapshots, filename],
+  };
+  const stored = await storeManifest(bucket, loaded.state, next);
+  if (stored.type === "error") {
+    return stored.response;
+  }
+  if (stored.type === "conflict") {
+    return preconditionFailed();
+  }
+
+  await finishPendingDelete(
+    bucket,
+    { document: next, etag: stored.object.etag },
+    filename,
+  );
+  return new Response(null, { status: 204, headers: { ETag: item.etag } });
+}
+
+async function loadAndCleanManifest(bucket: R2Bucket): Promise<ManifestLoadResult> {
+  const loaded = await loadManifest(bucket);
+  if (loaded.type === "error" || loaded.state.document.pendingDeletes.length === 0) {
+    return loaded;
+  }
+
+  let state = loaded.state;
+  for (const filename of [...state.document.pendingDeletes]) {
+    const cleaned = await finishPendingDelete(bucket, state, filename);
+    if (cleaned !== null) {
+      state = cleaned;
+    }
+  }
+  return { type: "ok", state };
+}
+
+async function finishPendingDelete(
+  bucket: R2Bucket,
+  state: ManifestState,
+  filename: string,
+): Promise<ManifestState | null> {
   try {
     await bucket.delete(snapshotKey(filename));
   } catch {
-    return storageUnavailable();
+    return null;
   }
-  return new Response(null, { status: 204, headers: { ETag: httpEtag(object) } });
+  const next: ManifestDocument = {
+    ...state.document,
+    pendingDeletes: state.document.pendingDeletes.filter((name) => name !== filename),
+  };
+  const stored = await storeManifest(bucket, state, next);
+  if (stored.type !== "ok") {
+    return null;
+  }
+  return { document: next, etag: stored.object.etag };
+}
+
+async function loadManifest(bucket: R2Bucket): Promise<ManifestLoadResult> {
+  let object: R2ObjectBody | null;
+  try {
+    object = await bucket.get(MANIFEST_KEY);
+  } catch {
+    return { type: "error", response: storageUnavailable() };
+  }
+  if (object === null) {
+    return { type: "ok", state: { document: emptyManifest(), etag: null } };
+  }
+  const document = await parseStoredManifest(object);
+  if (document === null) {
+    return {
+      type: "error",
+      response: errorResponse(500, "invalid_storage", "Stored manifest is invalid."),
+    };
+  }
+  return { type: "ok", state: { document, etag: object.etag } };
+}
+
+async function storeManifest(
+  bucket: R2Bucket,
+  current: ManifestState,
+  next: ManifestDocument,
+): Promise<BodyStoreResult> {
+  const onlyIf = current.etag === null
+    ? new Headers({ "If-None-Match": "*" })
+    : new Headers({ "If-Match": `"${current.etag}"` });
+  let stored: R2Object | null;
+  try {
+    stored = await bucket.put(MANIFEST_KEY, JSON.stringify(next), {
+      onlyIf,
+      httpMetadata: { contentType: "application/json" },
+    });
+  } catch {
+    return { type: "error", response: storageUnavailable() };
+  }
+  return stored === null ? { type: "conflict" } : { type: "ok", object: stored };
+}
+
+async function storeOrReuseBody(
+  bucket: R2Bucket,
+  filename: string,
+  body: Uint8Array,
+): Promise<BodyStoreResult> {
+  let stored: R2Object | null;
+  try {
+    stored = await bucket.put(snapshotKey(filename), body, {
+      onlyIf: new Headers({ "If-None-Match": "*" }),
+      httpMetadata: { contentType: SNAPSHOT_CONTENT_TYPE },
+    });
+  } catch {
+    return { type: "error", response: storageUnavailable() };
+  }
+  if (stored !== null) {
+    return { type: "ok", object: stored };
+  }
+
+  let existing: R2ObjectBody | null;
+  try {
+    existing = await bucket.get(snapshotKey(filename));
+  } catch {
+    return { type: "error", response: storageUnavailable() };
+  }
+  if (existing === null) {
+    return { type: "conflict" };
+  }
+  let existingBody: Uint8Array;
+  try {
+    existingBody = new Uint8Array(await existing.arrayBuffer());
+  } catch {
+    return { type: "error", response: storageUnavailable() };
+  }
+  if (!equalBytes(existingBody, body)) {
+    return { type: "conflict" };
+  }
+  return { type: "ok", object: existing };
 }
 
 function parseSnapshotRoute(pathname: string): SnapshotRoute | null {
@@ -324,7 +505,7 @@ function parseHeadInput(bytes: Uint8Array): HeadInput | null {
   return { schema: HEAD_SCHEMA, snapshot: candidate.snapshot };
 }
 
-async function parseStoredHead(object: R2ObjectBody): Promise<HeadDocument | null> {
+async function parseStoredManifest(object: R2ObjectBody): Promise<ManifestDocument | null> {
   let value: unknown;
   try {
     value = await object.json();
@@ -336,52 +517,112 @@ async function parseStoredHead(object: R2ObjectBody): Promise<HeadDocument | nul
   }
   const candidate = value as Record<string, unknown>;
   if (
-    candidate.schema !== HEAD_SCHEMA ||
-    typeof candidate.snapshot !== "string" ||
-    !SNAPSHOT_FILENAME_RE.test(candidate.snapshot) ||
-    typeof candidate.updatedAt !== "string" ||
-    !Number.isFinite(Date.parse(candidate.updatedAt))
+    candidate.schema !== MANIFEST_SCHEMA ||
+    !Array.isArray(candidate.snapshots) ||
+    !Array.isArray(candidate.pendingDeletes) ||
+    !Array.isArray(candidate.retiredSnapshots)
   ) {
     return null;
   }
+  const snapshots = parseManifestItems(candidate.snapshots);
+  const pendingDeletes = parsePendingDeletes(candidate.pendingDeletes);
+  const retiredSnapshots = parsePendingDeletes(candidate.retiredSnapshots);
+  if (snapshots === null || pendingDeletes === null || retiredSnapshots === null) {
+    return null;
+  }
+  const names = new Set(snapshots.map((item) => item.name));
+  if (pendingDeletes.some((name) => names.has(name))) {
+    return null;
+  }
+  const retired = new Set(retiredSnapshots);
+  if (
+    retiredSnapshots.some((name) => names.has(name)) ||
+    pendingDeletes.some((name) => !retired.has(name))
+  ) {
+    return null;
+  }
+  const head = parseHeadDocument(candidate.head);
+  if (head === undefined || (head !== null && !names.has(head.snapshot))) {
+    return null;
+  }
   return {
-    schema: HEAD_SCHEMA,
-    snapshot: candidate.snapshot,
-    updatedAt: candidate.updatedAt,
+    schema: MANIFEST_SCHEMA,
+    head,
+    snapshots,
+    pendingDeletes,
+    retiredSnapshots,
   };
 }
 
-async function loadHead(
-  bucket: R2Bucket,
-): Promise<{ type: "ok"; document: HeadDocument | null } | { type: "error"; response: Response }> {
-  let object: R2ObjectBody | null;
-  try {
-    object = await bucket.get(HEAD_KEY);
-  } catch {
-    return { type: "error", response: storageUnavailable() };
+function parseManifestItems(value: unknown[]): ManifestItem[] | null {
+  const items: ManifestItem[] = [];
+  const names = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return null;
+    }
+    const item = raw as Record<string, unknown>;
+    if (
+      typeof item.name !== "string" ||
+      !SNAPSHOT_FILENAME_RE.test(item.name) ||
+      names.has(item.name) ||
+      typeof item.size !== "number" ||
+      !Number.isSafeInteger(item.size) ||
+      item.size < 4 ||
+      item.size > MAX_SNAPSHOT_BYTES ||
+      typeof item.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(item.createdAt)) ||
+      typeof item.etag !== "string" ||
+      !isQuotedEtag(item.etag)
+    ) {
+      return null;
+    }
+    names.add(item.name);
+    items.push({
+      name: item.name,
+      size: item.size,
+      createdAt: item.createdAt,
+      etag: item.etag,
+    });
   }
-  if (object === null) {
-    return { type: "ok", document: null };
-  }
-  const document = await parseStoredHead(object);
-  if (document === null) {
-    return {
-      type: "error",
-      response: errorResponse(500, "invalid_storage", "Stored head is invalid."),
-    };
-  }
-  return { type: "ok", document };
+  return items;
 }
 
-async function listAll(bucket: R2Bucket, prefix: string): Promise<R2Object[]> {
-  const objects: R2Object[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await bucket.list({ prefix, cursor, limit: 1000 });
-    objects.push(...page.objects);
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor !== undefined);
-  return objects;
+function parsePendingDeletes(value: unknown[]): string[] | null {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "string" || !SNAPSHOT_FILENAME_RE.test(raw) || seen.has(raw)) {
+      return null;
+    }
+    seen.add(raw);
+    names.push(raw);
+  }
+  return names;
+}
+
+function parseHeadDocument(value: unknown): HeadDocument | null | undefined {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const head = value as Record<string, unknown>;
+  if (
+    head.schema !== HEAD_SCHEMA ||
+    typeof head.snapshot !== "string" ||
+    !SNAPSHOT_FILENAME_RE.test(head.snapshot) ||
+    typeof head.updatedAt !== "string" ||
+    !Number.isFinite(Date.parse(head.updatedAt))
+  ) {
+    return undefined;
+  }
+  return {
+    schema: HEAD_SCHEMA,
+    snapshot: head.snapshot,
+    updatedAt: head.updatedAt,
+  };
 }
 
 async function readBodyAtMost(request: Request, maximum: number): Promise<ReadBodyResult> {
@@ -392,7 +633,13 @@ async function readBodyAtMost(request: Request, maximum: number): Promise<ReadBo
   const chunks: Uint8Array[] = [];
   let total = 0;
   while (true) {
-    const next = await reader.read();
+    let next: ReadableStreamReadResult<Uint8Array>;
+    try {
+      next = await reader.read();
+    } catch {
+      await cancelReader(reader);
+      return { type: "error" };
+    }
     if (next.done) {
       break;
     }
@@ -401,7 +648,7 @@ async function readBodyAtMost(request: Request, maximum: number): Promise<ReadBo
       : new Uint8Array(next.value);
     total += chunk.byteLength;
     if (total > maximum) {
-      await reader.cancel();
+      await cancelReader(reader);
       return { type: "too_large" };
     }
     chunks.push(chunk);
@@ -415,18 +662,47 @@ async function readBodyAtMost(request: Request, maximum: number): Promise<ReadBo
   return { type: "ok", body };
 }
 
-function headWriteCondition(
+async function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+  try {
+    await reader.cancel();
+  } catch {
+    // The response remains deterministic even when the request stream cannot be cancelled.
+  }
+}
+
+function evaluateHeadPrecondition(
   request: Request,
-): { headers: Headers; create: boolean } | null {
+  state: ManifestState,
+): { type: "ok"; create: boolean } | { type: "error"; response: Response } {
   const ifMatch = request.headers.get("If-Match");
   const ifNoneMatch = request.headers.get("If-None-Match");
-  if (ifMatch !== null && ifMatch !== "" && ifNoneMatch === null) {
-    return { headers: new Headers({ "If-Match": ifMatch }), create: false };
-  }
   if (ifNoneMatch === "*" && ifMatch === null) {
-    return { headers: new Headers({ "If-None-Match": "*" }), create: true };
+    return state.document.head === null
+      ? { type: "ok", create: true }
+      : { type: "error", response: preconditionFailed() };
   }
-  return null;
+  if (ifMatch !== null && ifMatch !== "" && ifNoneMatch === null) {
+    if (state.etag === null || ifMatch !== `"${state.etag}"`) {
+      return { type: "error", response: preconditionFailed() };
+    }
+    return { type: "ok", create: false };
+  }
+  return { type: "error", response: preconditionRequired() };
+}
+
+function emptyManifest(): ManifestDocument {
+  return {
+    schema: MANIFEST_SCHEMA,
+    head: null,
+    snapshots: [],
+    pendingDeletes: [],
+    retiredSnapshots: [],
+  };
+}
+
+function compareManifestItems(left: ManifestItem, right: ManifestItem): number {
+  const byDate = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+  return byDate === 0 ? right.name.localeCompare(left.name) : byDate;
 }
 
 function contentLength(request: Request): number | null {
@@ -446,8 +722,32 @@ function snapshotKey(filename: string): string {
   return `${SNAPSHOT_PREFIX}${filename}`;
 }
 
+function manifestEtagHeaders(state: ManifestState): HeadersInit | undefined {
+  return state.etag === null ? undefined : { ETag: `"${state.etag}"` };
+}
+
 function httpEtag(object: R2Object): string {
   return object.httpEtag === "" ? `"${object.etag}"` : object.httpEtag;
+}
+
+function isQuotedEtag(value: string): boolean {
+  return value.length >= 2 && value.startsWith('"') && value.endsWith('"');
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) {
+    return false;
+  }
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function invalidBody(): Response {
+  return errorResponse(400, "invalid_body", "Request body could not be read.");
 }
 
 function preconditionRequired(): Response {
@@ -456,6 +756,10 @@ function preconditionRequired(): Response {
     "precondition_required",
     "If-Match or If-None-Match is required.",
   );
+}
+
+function preconditionFailed(): Response {
+  return errorResponse(412, "precondition_failed", "Precondition failed.");
 }
 
 function storageUnavailable(): Response {

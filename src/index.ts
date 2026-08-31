@@ -24,7 +24,7 @@ const CORS_HEADERS = {
     "If-None-Match",
     "X-Vibe-Prompt-Protocol",
   ].join(", "),
-  "Access-Control-Expose-Headers": "ETag",
+  "Access-Control-Expose-Headers": "ETag, X-Vibe-Prompt-Manifest-ETag",
 };
 
 export default {

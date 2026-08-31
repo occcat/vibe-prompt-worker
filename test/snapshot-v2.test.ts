@@ -1,3 +1,4 @@
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -25,6 +26,63 @@ import {
 
 const FIRST = snapshotFilename("auto", 1);
 const SECOND = snapshotFilename("backup", 2);
+const THIRD = snapshotFilename("auto", 3);
+
+type Deferred = {
+  promise: Promise<void>;
+  resolve: () => void;
+};
+
+function deferred(): Deferred {
+  let resolve = (): void => undefined;
+  const promise = new Promise<void>((fulfill) => {
+    resolve = fulfill;
+  });
+  return { promise, resolve };
+}
+
+function overrideBucket(overrides: Partial<Pick<R2Bucket, "delete" | "get" | "put">>): R2Bucket {
+  return new Proxy(env.SNAPSHOTS, {
+    get(target, property) {
+      const override = Reflect.get(overrides, property) as unknown;
+      if (override !== undefined) {
+        return override;
+      }
+      const original = Reflect.get(target, property) as unknown;
+      return typeof original === "function" ? original.bind(target) : original;
+    },
+  });
+}
+
+function isManifestMutation(
+  key: string,
+  value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
+  predicate: (manifest: Record<string, unknown>) => boolean,
+): boolean {
+  if (key !== "manifest.json" || typeof value !== "string") {
+    return false;
+  }
+  return predicate(JSON.parse(value) as Record<string, unknown>);
+}
+
+async function putHeadWithBucket(
+  bucket: R2Bucket,
+  filename: string,
+  etag: string,
+): Promise<Response> {
+  return fetchWithEnv(
+    { ...configuredEnv(), SNAPSHOTS: bucket },
+    V2_HEAD_URL,
+    {
+      method: "PUT",
+      headers: await v2WriteHeaders({
+        "Content-Type": "application/json",
+        "If-Match": etag,
+      }),
+      body: JSON.stringify({ schema: "vibe-prompt.head/2", snapshot: filename }),
+    },
+  );
+}
 
 describe("snapshot-only v2 health and auth", () => {
   it("exposes unauthenticated R2-only capabilities", async () => {
@@ -193,6 +251,27 @@ describe("snapshot-only v2 current head", () => {
     expect(list.items.find((item) => item.name === FIRST)?.isHead).toBe(false);
   });
 
+  it("publishes head with the manifest ETag returned by snapshot upload", async () => {
+    const first = await putV2Snapshot(FIRST, vpbeBody(0x11));
+    const firstManifestEtag = first.headers.get("X-Vibe-Prompt-Manifest-ETag");
+    expect(firstManifestEtag).toBeTruthy();
+    const initialHead = await putV2Head(FIRST, { "If-None-Match": "*" });
+    expect(initialHead.status).toBe(201);
+
+    const second = await putV2Snapshot(SECOND, vpbeBody(0x22));
+    const secondManifestEtag = second.headers.get("X-Vibe-Prompt-Manifest-ETag");
+    expect(secondManifestEtag).toBeTruthy();
+    expect(secondManifestEtag).not.toBe(initialHead.headers.get("ETag"));
+
+    const stale = await putV2Head(SECOND, {
+      "If-Match": initialHead.headers.get("ETag")!,
+    });
+    expect(stale.status).toBe(412);
+    const published = await putV2Head(SECOND, { "If-Match": secondManifestEtag! });
+    expect(published.status).toBe(200);
+    expect(await published.json()).toMatchObject({ snapshot: SECOND });
+  });
+
   it("returns 412 for stale create/update and 404 for missing snapshot", async () => {
     expect((await putV2Snapshot(FIRST, vpbeBody())).status).toBe(201);
     const created = await putV2Head(FIRST, { "If-None-Match": "*" });
@@ -279,5 +358,286 @@ describe("snapshot-only v2 R2 failures", () => {
     );
     expect(response.status).toBe(503);
     expect((await response.json() as ErrorBody).error.code).toBe("storage_unavailable");
+  });
+});
+
+describe("snapshot-only v2 manifest linearization", () => {
+  it("lets head=>B win over a stale DELETE(B) manifest CAS", async () => {
+    const first = await putV2Snapshot(FIRST, vpbeBody(0x11));
+    const second = await putV2Snapshot(SECOND, vpbeBody(0x22));
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    const createdHead = await putV2Head(FIRST, { "If-None-Match": "*" });
+    const oldManifestEtag = createdHead.headers.get("ETag")!;
+
+    const reachedDeleteCas = deferred();
+    const releaseDeleteCas = deferred();
+    const put: R2Bucket["put"] = async (key, value, options) => {
+      if (isManifestMutation(key, value, (manifest) => {
+        const pending = manifest.pendingDeletes as unknown[];
+        return pending.includes(SECOND);
+      })) {
+        reachedDeleteCas.resolve();
+        await releaseDeleteCas.promise;
+      }
+      return env.SNAPSHOTS.put(key, value, options);
+    };
+    const deletingBucket = overrideBucket({ put });
+    const deleting = fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: deletingBucket },
+      v2SnapshotUrl(SECOND),
+      {
+        method: "DELETE",
+        headers: await v2WriteHeaders({
+          "If-Match": second.headers.get("ETag")!,
+        }),
+      },
+    );
+    await reachedDeleteCas.promise;
+
+    const advanced = await putV2Head(SECOND, { "If-Match": oldManifestEtag });
+    expect(advanced.status).toBe(200);
+    releaseDeleteCas.resolve();
+    expect((await deleting).status).toBe(412);
+
+    expect(await (await getV2Head()).json()).toMatchObject({ snapshot: SECOND });
+    const listed = await (await listV2Snapshots()).json() as V2SnapshotListBody;
+    expect(listed.items.find((item) => item.name === SECOND)?.isHead).toBe(true);
+  });
+
+  it("lets DELETE(B) win over a stale head=>B manifest CAS", async () => {
+    expect((await putV2Snapshot(FIRST, vpbeBody(0x11))).status).toBe(201);
+    const second = await putV2Snapshot(SECOND, vpbeBody(0x22));
+    expect(second.status).toBe(201);
+    const createdHead = await putV2Head(FIRST, { "If-None-Match": "*" });
+
+    const reachedHeadCas = deferred();
+    const releaseHeadCas = deferred();
+    const put: R2Bucket["put"] = async (key, value, options) => {
+      if (isManifestMutation(key, value, (manifest) => {
+        const head = manifest.head as Record<string, unknown>;
+        return head.snapshot === SECOND;
+      })) {
+        reachedHeadCas.resolve();
+        await releaseHeadCas.promise;
+      }
+      return env.SNAPSHOTS.put(key, value, options);
+    };
+    const advancing = putHeadWithBucket(
+      overrideBucket({ put }),
+      SECOND,
+      createdHead.headers.get("ETag")!,
+    );
+    await reachedHeadCas.promise;
+
+    const deleted = await deleteV2Snapshot(SECOND, second.headers.get("ETag")!);
+    expect(deleted.status).toBe(204);
+    releaseHeadCas.resolve();
+    expect((await advancing).status).toBe(412);
+
+    expect(await (await getV2Head()).json()).toMatchObject({ snapshot: FIRST });
+    const listed = await (await listV2Snapshots()).json() as V2SnapshotListBody;
+    expect(listed.items.map((item) => item.name)).not.toContain(SECOND);
+  });
+
+  it("keeps a delayed list internally consistent with its manifest ETag", async () => {
+    expect((await putV2Snapshot(FIRST, vpbeBody(0x11))).status).toBe(201);
+    expect((await putV2Snapshot(SECOND, vpbeBody(0x22))).status).toBe(201);
+    const createdHead = await putV2Head(FIRST, { "If-None-Match": "*" });
+    const oldEtag = createdHead.headers.get("ETag")!;
+
+    const capturedManifest = deferred();
+    const releaseManifest = deferred();
+    let delayed = true;
+    const get: R2Bucket["get"] = async (key, options) => {
+      const object = await env.SNAPSHOTS.get(key, options);
+      if (key === "manifest.json" && delayed) {
+        delayed = false;
+        capturedManifest.resolve();
+        await releaseManifest.promise;
+      }
+      return object;
+    };
+    const oldListPromise = fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: overrideBucket({ get }) },
+      V2_SNAPSHOTS_URL,
+      { headers: await authHeaders() },
+    );
+    await capturedManifest.promise;
+    const advanced = await putV2Head(SECOND, { "If-Match": oldEtag });
+    expect(advanced.status).toBe(200);
+    releaseManifest.resolve();
+
+    const oldListResponse = await oldListPromise;
+    const oldList = await oldListResponse.json() as V2SnapshotListBody;
+    expect(oldListResponse.headers.get("ETag")).toBe(oldEtag);
+    expect(oldList.items.filter((item) => item.isHead).map((item) => item.name))
+      .toEqual([FIRST]);
+    const currentHead = await getV2Head();
+    expect(currentHead.headers.get("ETag")).toBe(advanced.headers.get("ETag"));
+    expect(await currentHead.json()).toMatchObject({ snapshot: SECOND });
+  });
+
+  it("allows exactly one competing head manifest CAS", async () => {
+    expect((await putV2Snapshot(FIRST, vpbeBody(0x11))).status).toBe(201);
+    expect((await putV2Snapshot(SECOND, vpbeBody(0x22))).status).toBe(201);
+    expect((await putV2Snapshot(THIRD, vpbeBody(0x33))).status).toBe(201);
+    const createdHead = await putV2Head(FIRST, { "If-None-Match": "*" });
+    const etag = createdHead.headers.get("ETag")!;
+
+    const reachedCas = deferred();
+    const releaseCas = deferred();
+    const put: R2Bucket["put"] = async (key, value, options) => {
+      if (isManifestMutation(key, value, (manifest) => {
+        const head = manifest.head as Record<string, unknown>;
+        return head.snapshot === SECOND;
+      })) {
+        reachedCas.resolve();
+        await releaseCas.promise;
+      }
+      return env.SNAPSHOTS.put(key, value, options);
+    };
+    const firstUpdate = putHeadWithBucket(overrideBucket({ put }), SECOND, etag);
+    await reachedCas.promise;
+    const secondUpdate = await putV2Head(THIRD, { "If-Match": etag });
+    expect(secondUpdate.status).toBe(200);
+    releaseCas.resolve();
+    expect((await firstUpdate).status).toBe(412);
+    expect(await (await getV2Head()).json()).toMatchObject({ snapshot: THIRD });
+  });
+
+  it("keeps a logically deleted snapshot hidden until failed physical GC recovers", async () => {
+    const second = await putV2Snapshot(SECOND, vpbeBody(0x22));
+    expect(second.status).toBe(201);
+    const deleteMethod: R2Bucket["delete"] = async (keys) => {
+      if (keys === `snapshots/${SECOND}`) {
+        throw new Error("physical delete unavailable");
+      }
+      return env.SNAPSHOTS.delete(keys);
+    };
+    const failingBucket = overrideBucket({ delete: deleteMethod });
+    const deleted = await fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: failingBucket },
+      v2SnapshotUrl(SECOND),
+      {
+        method: "DELETE",
+        headers: await v2WriteHeaders({
+          "If-Match": second.headers.get("ETag")!,
+        }),
+      },
+    );
+    expect(deleted.status).toBe(204);
+    expect(await env.SNAPSHOTS.head(`snapshots/${SECOND}`)).not.toBeNull();
+
+    const hiddenList = await fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: failingBucket },
+      V2_SNAPSHOTS_URL,
+      { headers: await authHeaders() },
+    );
+    const hidden = await hiddenList.json() as V2SnapshotListBody;
+    expect(hidden.items.map((item) => item.name)).not.toContain(SECOND);
+    const hiddenGet = await fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: failingBucket },
+      v2SnapshotUrl(SECOND),
+      { headers: await authHeaders() },
+    );
+    expect(hiddenGet.status).toBe(404);
+
+    const recovered = await listV2Snapshots();
+    expect(recovered.status).toBe(200);
+    expect(await env.SNAPSHOTS.head(`snapshots/${SECOND}`)).toBeNull();
+    const reused = await putV2Snapshot(SECOND, vpbeBody(0x44));
+    expect(reused.status).toBe(409);
+    expect((await reused.json() as ErrorBody).error.code).toBe("snapshot_deleted");
+  });
+
+  it("hides a registration CAS orphan and reuses it on identical retry", async () => {
+    expect((await putV2Snapshot(FIRST, vpbeBody(0x11))).status).toBe(201);
+    const reachedRegistration = deferred();
+    const releaseRegistration = deferred();
+    const put: R2Bucket["put"] = async (key, value, options) => {
+      if (isManifestMutation(key, value, (manifest) => {
+        const snapshots = manifest.snapshots as Array<Record<string, unknown>>;
+        return snapshots.some((item) => item.name === SECOND);
+      })) {
+        reachedRegistration.resolve();
+        await releaseRegistration.promise;
+      }
+      return env.SNAPSHOTS.put(key, value, options);
+    };
+    const payload = vpbeBody(0x22);
+    const losingUpload = fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: overrideBucket({ put }) },
+      v2SnapshotUrl(SECOND),
+      {
+        method: "PUT",
+        headers: await v2WriteHeaders({
+          "Content-Type": "application/octet-stream",
+          "If-None-Match": "*",
+        }),
+        body: payload,
+      },
+    );
+    await reachedRegistration.promise;
+    expect((await putV2Snapshot(THIRD, vpbeBody(0x33))).status).toBe(201);
+    releaseRegistration.resolve();
+    expect((await losingUpload).status).toBe(412);
+
+    expect(await env.SNAPSHOTS.head(`snapshots/${SECOND}`)).not.toBeNull();
+    expect((await getV2Snapshot(SECOND)).status).toBe(404);
+    const hidden = await (await listV2Snapshots()).json() as V2SnapshotListBody;
+    expect(hidden.items.map((item) => item.name)).not.toContain(SECOND);
+
+    const retry = await putV2Snapshot(SECOND, payload);
+    expect(retry.status).toBe(201);
+    expect(new Uint8Array(await (await getV2Snapshot(SECOND)).arrayBuffer()))
+      .toEqual(payload);
+  });
+});
+
+describe("snapshot-only v2 request stream failures", () => {
+  it("maps reader.read failure to a stable JSON error", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      pull() {
+        throw new Error("read failed");
+      },
+    });
+    const response = await fetchConfigured(v2SnapshotUrl(FIRST), {
+      method: "PUT",
+      headers: await v2WriteHeaders({
+        "Content-Type": "application/octet-stream",
+        "If-None-Match": "*",
+      }),
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Content-Type")).toMatch(/^application\/json\b/);
+    expect((await response.json() as ErrorBody).error.code).toBe("invalid_body");
+  });
+
+  it("keeps the 413 JSON response when reader.cancel fails", async () => {
+    const oversized = new Uint8Array(20 * 1024 * 1024 + 1);
+    oversized.set(vpbeBody());
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(oversized);
+      },
+      cancel() {
+        throw new Error("cancel failed");
+      },
+    });
+    const response = await fetchConfigured(v2SnapshotUrl(FIRST), {
+      method: "PUT",
+      headers: await v2WriteHeaders({
+        "Content-Type": "application/octet-stream",
+        "If-None-Match": "*",
+      }),
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+    expect(response.status).toBe(413);
+    expect(response.headers.get("Content-Type")).toMatch(/^application\/json\b/);
+    expect((await response.json() as ErrorBody).error.code).toBe("payload_too_large");
   });
 });
