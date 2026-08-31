@@ -15,9 +15,8 @@ export type ErrorCode =
   | "payload_too_large"
   | "method_not_allowed"
   | "snapshot_is_head"
-  | "snapshot_deleting"
-  | "snapshot_deleted"
   | "snapshot_not_found"
+  | "gc_backlog_full"
   | "storage_unavailable";
 
 export function jsonResponse(

@@ -2,16 +2,23 @@ import { errorResponse, jsonResponse } from "./http";
 import { hasVpbeMagic } from "./magic";
 
 const HEAD_SCHEMA = "vibe-prompt.head/2";
+const BODY_PREFIX = "bodies/";
+const GC_DELETE_BUDGET = 2;
+const GC_ORPHAN_GRACE_MS = 5 * 60 * 1000;
+const GC_SCAN_KEY = "gc-state.json";
+const GC_SCAN_LIMIT = 8;
+const GC_STATE_SCHEMA = "vibe-prompt.gc-state/2";
 const MANIFEST_KEY = "manifest.json";
 const MANIFEST_SCHEMA = "vibe-prompt.manifest/2";
 const SNAPSHOT_CONTENT_TYPE = "application/octet-stream";
-const SNAPSHOT_PREFIX = "snapshots/";
 const SNAPSHOTS_SCHEMA = "vibe-prompt.snapshots/2";
 const MAX_HEAD_BYTES = 16 * 1024;
+const MAX_PENDING_DELETES = 64;
 export const MAX_SNAPSHOT_BYTES = 20 * 1024 * 1024;
 
 const SNAPSHOT_FILENAME_RE =
   /^vibe-prompt-(auto|backup)_(\d{8}T\d{6}Z)_([0-9a-f]{8})_([0-9a-f]{6})\.vpb$/;
+const BODY_KEY_RE = /^bodies\/[0-9a-f]{32}\.vpb$/;
 
 type HeadDocument = {
   schema: typeof HEAD_SCHEMA;
@@ -29,6 +36,7 @@ type ManifestItem = {
   size: number;
   createdAt: string;
   etag: string;
+  bodyKey: string;
 };
 
 type ManifestDocument = {
@@ -36,7 +44,6 @@ type ManifestDocument = {
   head: HeadDocument | null;
   snapshots: ManifestItem[];
   pendingDeletes: string[];
-  retiredSnapshots: string[];
 };
 
 type ManifestState = {
@@ -178,7 +185,10 @@ async function listSnapshots(bucket: R2Bucket): Promise<Response> {
   const items = [...document.snapshots]
     .sort(compareManifestItems)
     .map((item) => ({
-      ...item,
+      name: item.name,
+      size: item.size,
+      createdAt: item.createdAt,
+      etag: item.etag,
       isHead: document.head?.snapshot === item.name,
     }));
   return jsonResponse(
@@ -200,7 +210,7 @@ async function getSnapshot(bucket: R2Bucket, filename: string): Promise<Response
 
   let object: R2ObjectBody | null;
   try {
-    object = await bucket.get(snapshotKey(filename));
+    object = await bucket.get(item.bodyKey);
   } catch {
     return storageUnavailable();
   }
@@ -257,14 +267,7 @@ async function putSnapshot(
   if (loaded.state.document.snapshots.some((item) => item.name === filename)) {
     return preconditionFailed();
   }
-  if (loaded.state.document.pendingDeletes.includes(filename)) {
-    return errorResponse(409, "snapshot_deleting", "Snapshot deletion is pending.");
-  }
-  if (loaded.state.document.retiredSnapshots.includes(filename)) {
-    return errorResponse(409, "snapshot_deleted", "Snapshot filename is retired.");
-  }
-
-  const body = await storeOrReuseBody(bucket, filename, read.body);
+  const body = await storeBodyGeneration(bucket, read.body);
   if (body.type === "error") {
     return body.response;
   }
@@ -276,6 +279,7 @@ async function putSnapshot(
     size: body.object.size,
     createdAt: body.object.uploaded.toISOString(),
     etag: httpEtag(body.object),
+    bodyKey: body.object.key,
   };
   const next: ManifestDocument = {
     ...loaded.state.document,
@@ -320,14 +324,16 @@ async function deleteSnapshot(
   if (loaded.state.document.head?.snapshot === filename) {
     return errorResponse(409, "snapshot_is_head", "Current snapshot cannot be deleted.");
   }
+  if (loaded.state.document.pendingDeletes.length >= MAX_PENDING_DELETES) {
+    return errorResponse(503, "gc_backlog_full", "Snapshot cleanup backlog is full.");
+  }
 
   const next: ManifestDocument = {
     ...loaded.state.document,
     snapshots: loaded.state.document.snapshots.filter(
       (candidate) => candidate.name !== filename,
     ),
-    pendingDeletes: [...loaded.state.document.pendingDeletes, filename],
-    retiredSnapshots: [...loaded.state.document.retiredSnapshots, filename],
+    pendingDeletes: [...loaded.state.document.pendingDeletes, item.bodyKey],
   };
   const stored = await storeManifest(bucket, loaded.state, next);
   if (stored.type === "error") {
@@ -337,49 +343,138 @@ async function deleteSnapshot(
     return preconditionFailed();
   }
 
-  await finishPendingDelete(
+  await cleanPendingDeletes(
     bucket,
     { document: next, etag: stored.object.etag },
-    filename,
+    1,
   );
   return new Response(null, { status: 204, headers: { ETag: item.etag } });
 }
 
 async function loadAndCleanManifest(bucket: R2Bucket): Promise<ManifestLoadResult> {
   const loaded = await loadManifest(bucket);
-  if (loaded.type === "error" || loaded.state.document.pendingDeletes.length === 0) {
+  if (loaded.type === "error") {
     return loaded;
   }
-
-  let state = loaded.state;
-  for (const filename of [...state.document.pendingDeletes]) {
-    const cleaned = await finishPendingDelete(bucket, state, filename);
-    if (cleaned !== null) {
-      state = cleaned;
-    }
+  let state = await cleanPendingDeletes(bucket, loaded.state, GC_DELETE_BUDGET);
+  const remainingBudget = GC_DELETE_BUDGET - Math.min(
+    loaded.state.document.pendingDeletes.length,
+    GC_DELETE_BUDGET,
+  );
+  if (remainingBudget > 0) {
+    state = await claimAndCleanOrphans(bucket, state, remainingBudget);
   }
   return { type: "ok", state };
 }
 
-async function finishPendingDelete(
+async function cleanPendingDeletes(
   bucket: R2Bucket,
   state: ManifestState,
-  filename: string,
-): Promise<ManifestState | null> {
+  budget: number,
+): Promise<ManifestState> {
+  const keys = state.document.pendingDeletes.slice(0, budget);
+  if (keys.length === 0) {
+    return state;
+  }
   try {
-    await bucket.delete(snapshotKey(filename));
+    await bucket.delete(keys);
   } catch {
-    return null;
+    return state;
+  }
+  const removed = new Set(keys);
+  const next: ManifestDocument = {
+    ...state.document,
+    pendingDeletes: state.document.pendingDeletes.filter((key) => !removed.has(key)),
+  };
+  const stored = await storeManifest(bucket, state, next);
+  if (stored.type === "ok") {
+    return { document: next, etag: stored.object.etag };
+  }
+  const reloaded = await loadManifest(bucket);
+  return reloaded.type === "ok" ? reloaded.state : state;
+}
+
+async function claimAndCleanOrphans(
+  bucket: R2Bucket,
+  state: ManifestState,
+  budget: number,
+): Promise<ManifestState> {
+  const candidates = await scanOrphanCandidates(bucket, state, budget);
+  if (candidates.length === 0) {
+    return state;
   }
   const next: ManifestDocument = {
     ...state.document,
-    pendingDeletes: state.document.pendingDeletes.filter((name) => name !== filename),
+    pendingDeletes: [...state.document.pendingDeletes, ...candidates],
   };
-  const stored = await storeManifest(bucket, state, next);
-  if (stored.type !== "ok") {
-    return null;
+  const claimed = await storeManifest(bucket, state, next);
+  if (claimed.type !== "ok") {
+    const reloaded = await loadManifest(bucket);
+    return reloaded.type === "ok" ? reloaded.state : state;
   }
-  return { document: next, etag: stored.object.etag };
+  return cleanPendingDeletes(
+    bucket,
+    { document: next, etag: claimed.object.etag },
+    budget,
+  );
+}
+
+async function scanOrphanCandidates(
+  bucket: R2Bucket,
+  state: ManifestState,
+  budget: number,
+): Promise<string[]> {
+  const cursor = await loadGcCursor(bucket);
+  let page: R2Objects;
+  try {
+    page = await bucket.list({
+      prefix: BODY_PREFIX,
+      cursor,
+      limit: GC_SCAN_LIMIT,
+      include: ["customMetadata"],
+    });
+  } catch {
+    await storeGcCursor(bucket, undefined);
+    return [];
+  }
+  await storeGcCursor(bucket, page.truncated ? page.cursor : undefined);
+  const referenced = new Set(state.document.snapshots.map((item) => item.bodyKey));
+  const pending = new Set(state.document.pendingDeletes);
+  const now = Date.now();
+  return page.objects
+    .filter((object) => {
+      const gcAfter = Number(object.customMetadata?.gcAfter);
+      return !referenced.has(object.key) && !pending.has(object.key) && gcAfter <= now;
+    })
+    .slice(0, Math.min(budget, MAX_PENDING_DELETES - pending.size))
+    .map((object) => object.key);
+}
+
+async function loadGcCursor(bucket: R2Bucket): Promise<string | undefined> {
+  try {
+    const object = await bucket.get(GC_SCAN_KEY);
+    if (object === null) {
+      return undefined;
+    }
+    const value = await object.json() as { schema?: unknown; cursor?: unknown };
+    return value.schema === GC_STATE_SCHEMA && typeof value.cursor === "string"
+      ? value.cursor
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function storeGcCursor(bucket: R2Bucket, cursor: string | undefined): Promise<void> {
+  try {
+    await bucket.put(
+      GC_SCAN_KEY,
+      JSON.stringify({ schema: GC_STATE_SCHEMA, cursor: cursor ?? null }),
+      { httpMetadata: { contentType: "application/json" } },
+    );
+  } catch {
+    // A later bounded scan can safely revisit the same page.
+  }
 }
 
 async function loadManifest(bucket: R2Bucket): Promise<ManifestLoadResult> {
@@ -422,43 +517,22 @@ async function storeManifest(
   return stored === null ? { type: "conflict" } : { type: "ok", object: stored };
 }
 
-async function storeOrReuseBody(
+async function storeBodyGeneration(
   bucket: R2Bucket,
-  filename: string,
   body: Uint8Array,
 ): Promise<BodyStoreResult> {
+  const bodyKey = `${BODY_PREFIX}${crypto.randomUUID().replaceAll("-", "")}.vpb`;
   let stored: R2Object | null;
   try {
-    stored = await bucket.put(snapshotKey(filename), body, {
+    stored = await bucket.put(bodyKey, body, {
       onlyIf: new Headers({ "If-None-Match": "*" }),
       httpMetadata: { contentType: SNAPSHOT_CONTENT_TYPE },
+      customMetadata: { gcAfter: String(Date.now() + GC_ORPHAN_GRACE_MS) },
     });
   } catch {
     return { type: "error", response: storageUnavailable() };
   }
-  if (stored !== null) {
-    return { type: "ok", object: stored };
-  }
-
-  let existing: R2ObjectBody | null;
-  try {
-    existing = await bucket.get(snapshotKey(filename));
-  } catch {
-    return { type: "error", response: storageUnavailable() };
-  }
-  if (existing === null) {
-    return { type: "conflict" };
-  }
-  let existingBody: Uint8Array;
-  try {
-    existingBody = new Uint8Array(await existing.arrayBuffer());
-  } catch {
-    return { type: "error", response: storageUnavailable() };
-  }
-  if (!equalBytes(existingBody, body)) {
-    return { type: "conflict" };
-  }
-  return { type: "ok", object: existing };
+  return stored === null ? { type: "conflict" } : { type: "ok", object: stored };
 }
 
 function parseSnapshotRoute(pathname: string): SnapshotRoute | null {
@@ -519,26 +593,18 @@ async function parseStoredManifest(object: R2ObjectBody): Promise<ManifestDocume
   if (
     candidate.schema !== MANIFEST_SCHEMA ||
     !Array.isArray(candidate.snapshots) ||
-    !Array.isArray(candidate.pendingDeletes) ||
-    !Array.isArray(candidate.retiredSnapshots)
+    !Array.isArray(candidate.pendingDeletes)
   ) {
     return null;
   }
   const snapshots = parseManifestItems(candidate.snapshots);
   const pendingDeletes = parsePendingDeletes(candidate.pendingDeletes);
-  const retiredSnapshots = parsePendingDeletes(candidate.retiredSnapshots);
-  if (snapshots === null || pendingDeletes === null || retiredSnapshots === null) {
+  if (snapshots === null || pendingDeletes === null) {
     return null;
   }
   const names = new Set(snapshots.map((item) => item.name));
-  if (pendingDeletes.some((name) => names.has(name))) {
-    return null;
-  }
-  const retired = new Set(retiredSnapshots);
-  if (
-    retiredSnapshots.some((name) => names.has(name)) ||
-    pendingDeletes.some((name) => !retired.has(name))
-  ) {
+  const activeBodyKeys = new Set(snapshots.map((item) => item.bodyKey));
+  if (pendingDeletes.some((key) => activeBodyKeys.has(key))) {
     return null;
   }
   const head = parseHeadDocument(candidate.head);
@@ -550,13 +616,13 @@ async function parseStoredManifest(object: R2ObjectBody): Promise<ManifestDocume
     head,
     snapshots,
     pendingDeletes,
-    retiredSnapshots,
   };
 }
 
 function parseManifestItems(value: unknown[]): ManifestItem[] | null {
   const items: ManifestItem[] = [];
   const names = new Set<string>();
+  const bodyKeys = new Set<string>();
   for (const raw of value) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       return null;
@@ -573,32 +639,37 @@ function parseManifestItems(value: unknown[]): ManifestItem[] | null {
       typeof item.createdAt !== "string" ||
       !Number.isFinite(Date.parse(item.createdAt)) ||
       typeof item.etag !== "string" ||
-      !isQuotedEtag(item.etag)
+      !isQuotedEtag(item.etag) ||
+      typeof item.bodyKey !== "string" ||
+      !BODY_KEY_RE.test(item.bodyKey) ||
+      bodyKeys.has(item.bodyKey)
     ) {
       return null;
     }
     names.add(item.name);
+    bodyKeys.add(item.bodyKey);
     items.push({
       name: item.name,
       size: item.size,
       createdAt: item.createdAt,
       etag: item.etag,
+      bodyKey: item.bodyKey,
     });
   }
   return items;
 }
 
 function parsePendingDeletes(value: unknown[]): string[] | null {
-  const names: string[] = [];
+  const keys: string[] = [];
   const seen = new Set<string>();
   for (const raw of value) {
-    if (typeof raw !== "string" || !SNAPSHOT_FILENAME_RE.test(raw) || seen.has(raw)) {
+    if (typeof raw !== "string" || !BODY_KEY_RE.test(raw) || seen.has(raw)) {
       return null;
     }
     seen.add(raw);
-    names.push(raw);
+    keys.push(raw);
   }
-  return names;
+  return keys.length <= MAX_PENDING_DELETES ? keys : null;
 }
 
 function parseHeadDocument(value: unknown): HeadDocument | null | undefined {
@@ -696,7 +767,6 @@ function emptyManifest(): ManifestDocument {
     head: null,
     snapshots: [],
     pendingDeletes: [],
-    retiredSnapshots: [],
   };
 }
 
@@ -718,10 +788,6 @@ function hasContentType(request: Request, expected: string): boolean {
   return request.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase() === expected;
 }
 
-function snapshotKey(filename: string): string {
-  return `${SNAPSHOT_PREFIX}${filename}`;
-}
-
 function manifestEtagHeaders(state: ManifestState): HeadersInit | undefined {
   return state.etag === null ? undefined : { ETag: `"${state.etag}"` };
 }
@@ -732,18 +798,6 @@ function httpEtag(object: R2Object): string {
 
 function isQuotedEtag(value: string): boolean {
   return value.length >= 2 && value.startsWith('"') && value.endsWith('"');
-}
-
-function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
-  if (left.byteLength !== right.byteLength) {
-    return false;
-  }
-  for (let index = 0; index < left.byteLength; index++) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function invalidBody(): Response {

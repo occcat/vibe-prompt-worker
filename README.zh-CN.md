@@ -43,8 +43,8 @@ SHA-256(UTF-8(AUTH_VALUE) || UTF-8("vibe-prompt-worker-v1"))
 
 v2 部署会通过 Wrangler migration 删除旧 `VaultObject` Durable Object 类及其中的
 SQLite 数据，并且不会迁移 v1 对象同步数据。
-v2 只读取 `snapshots/` 前缀和 `head.json`，因此旧版 R2 key 会被忽略；
-全部客户端升级后，可按需清理这些旧 key。
+v2 使用 `manifest.json`、`bodies/` 下的 generation key 和有界 GC 状态，
+因此旧版 R2 key 会被忽略；全部客户端升级后，可按需清理这些旧 key。
 
 ## v2 协议
 
@@ -122,12 +122,12 @@ ETag 标识整个 manifest 版本，
 目标快照必须已在同一 manifest 中。并发或过期写返回 `412`，
 客户端应重新获取状态，避免静默覆盖其他设备。
 
-上传先写不可变正文，再用 manifest CAS 注册。
-CAS 竞争失败时，未注册正文不会出现在列表、head 或下载接口中；
-相同正文重试会复用它并完成注册，同名不同正文会被拒绝。
-删除先用 manifest CAS 移除非 head 成员，再清理物理正文。
-清理失败时仍保持逻辑删除，后续请求会继续重试清理。
-已删除文件名会永久停用，避免清理竞态误删同名新正文。
+每次上传先创建唯一且不可变的 generation 正文，再用 manifest CAS 注册。
+CAS 竞争失败时，未注册 generation 不会出现在列表、head 或下载接口中，
+有界 orphan GC 最终会回收它。删除先用 manifest CAS 移除非 head 成员，
+再清理对应的精确 generation。
+清理采用固定的单请求预算，并在后续请求中渐进恢复。
+删除后文件名可以复用；旧 GC 只持有旧 generation key，不会误删替代正文。
 
 ## 开发
 

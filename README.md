@@ -44,8 +44,8 @@ bucket name in `wrangler.jsonc` when necessary.
 
 The v2 deployment intentionally deletes the old `VaultObject` Durable Object class and its SQLite
 data through a Wrangler migration. It does not migrate v1 object-sync data. Existing R2 keys from
-v1 are ignored because v2 reads only the `snapshots/` prefix and `head.json`; delete old keys after
-all clients have upgraded if they are no longer needed.
+v1 are ignored because v2 uses `manifest.json`, generation keys under `bodies/`, and bounded GC
+state. Delete old keys after all clients have upgraded if they are no longer needed.
 
 ## Protocol v2
 
@@ -120,12 +120,12 @@ an older head ETag stale. After uploading a snapshot, use its
 `updatedAt`. The referenced snapshot must already be in the same manifest. A racing or stale write
 returns `412`, so clients can refetch instead of silently overwriting another device.
 
-Snapshot upload writes the immutable body before registering it through manifest CAS. If CAS loses
-a race, the unregistered body stays invisible to list, head, and download. Retrying the identical
-upload reuses that body and registers it; different bytes under the same filename are rejected.
-Deletion first removes a non-head member through manifest CAS and then performs physical cleanup.
-A cleanup failure stays logically deleted and is retried by later requests. Deleted filenames stay
-retired, preventing a cleanup race from deleting a newly uploaded body under the same name.
+Each upload gets a unique immutable generation body key before manifest registration. If CAS loses
+a race, the unregistered generation stays invisible to list, head, and download and bounded orphan
+GC eventually reclaims it. Deletion first removes a non-head member through manifest CAS and then
+cleans that exact generation. Cleanup uses a fixed per-request budget and resumes on later requests.
+The filename can be reused after deletion because stale GC only knows the old generation key and
+cannot delete a replacement generation.
 
 ## Development
 

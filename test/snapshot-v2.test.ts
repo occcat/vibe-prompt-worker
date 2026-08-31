@@ -33,6 +33,11 @@ type Deferred = {
   resolve: () => void;
 };
 
+type StoredManifest = {
+  snapshots: Array<{ name: string; bodyKey: string }>;
+  pendingDeletes: string[];
+};
+
 function deferred(): Deferred {
   let resolve = (): void => undefined;
   const promise = new Promise<void>((fulfill) => {
@@ -41,7 +46,9 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
-function overrideBucket(overrides: Partial<Pick<R2Bucket, "delete" | "get" | "put">>): R2Bucket {
+function overrideBucket(
+  overrides: Partial<Pick<R2Bucket, "delete" | "get" | "list" | "put">>,
+): R2Bucket {
   return new Proxy(env.SNAPSHOTS, {
     get(target, property) {
       const override = Reflect.get(overrides, property) as unknown;
@@ -63,6 +70,24 @@ function isManifestMutation(
     return false;
   }
   return predicate(JSON.parse(value) as Record<string, unknown>);
+}
+
+async function storedManifest(): Promise<StoredManifest> {
+  const object = await env.SNAPSHOTS.get("manifest.json");
+  if (object === null) {
+    throw new Error("manifest is missing");
+  }
+  return object.json() as Promise<StoredManifest>;
+}
+
+async function bodyKeyFor(filename: string): Promise<string> {
+  const item = (await storedManifest()).snapshots.find((candidate) => {
+    return candidate.name === filename;
+  });
+  if (item === undefined) {
+    throw new Error(`missing manifest item: ${filename}`);
+  }
+  return item.bodyKey;
 }
 
 async function putHeadWithBucket(
@@ -375,7 +400,8 @@ describe("snapshot-only v2 manifest linearization", () => {
     const put: R2Bucket["put"] = async (key, value, options) => {
       if (isManifestMutation(key, value, (manifest) => {
         const pending = manifest.pendingDeletes as unknown[];
-        return pending.includes(SECOND);
+        const snapshots = manifest.snapshots as Array<Record<string, unknown>>;
+        return pending.length > 0 && !snapshots.some((item) => item.name === SECOND);
       })) {
         reachedDeleteCas.resolve();
         await releaseDeleteCas.promise;
@@ -509,8 +535,9 @@ describe("snapshot-only v2 manifest linearization", () => {
   it("keeps a logically deleted snapshot hidden until failed physical GC recovers", async () => {
     const second = await putV2Snapshot(SECOND, vpbeBody(0x22));
     expect(second.status).toBe(201);
+    const oldBodyKey = await bodyKeyFor(SECOND);
     const deleteMethod: R2Bucket["delete"] = async (keys) => {
-      if (keys === `snapshots/${SECOND}`) {
+      if (Array.isArray(keys) && keys.includes(oldBodyKey)) {
         throw new Error("physical delete unavailable");
       }
       return env.SNAPSHOTS.delete(keys);
@@ -527,7 +554,7 @@ describe("snapshot-only v2 manifest linearization", () => {
       },
     );
     expect(deleted.status).toBe(204);
-    expect(await env.SNAPSHOTS.head(`snapshots/${SECOND}`)).not.toBeNull();
+    expect(await env.SNAPSHOTS.head(oldBodyKey)).not.toBeNull();
 
     const hiddenList = await fetchWithEnv(
       { ...configuredEnv(), SNAPSHOTS: failingBucket },
@@ -545,13 +572,14 @@ describe("snapshot-only v2 manifest linearization", () => {
 
     const recovered = await listV2Snapshots();
     expect(recovered.status).toBe(200);
-    expect(await env.SNAPSHOTS.head(`snapshots/${SECOND}`)).toBeNull();
+    expect(await env.SNAPSHOTS.head(oldBodyKey)).toBeNull();
     const reused = await putV2Snapshot(SECOND, vpbeBody(0x44));
-    expect(reused.status).toBe(409);
-    expect((await reused.json() as ErrorBody).error.code).toBe("snapshot_deleted");
+    expect(reused.status).toBe(201);
+    expect(await bodyKeyFor(SECOND)).not.toBe(oldBodyKey);
+    expect((await getV2Snapshot(SECOND)).status).toBe(200);
   });
 
-  it("hides a registration CAS orphan and reuses it on identical retry", async () => {
+  it("eventually reclaims a registration CAS orphan without client retry", async () => {
     expect((await putV2Snapshot(FIRST, vpbeBody(0x11))).status).toBe(201);
     const reachedRegistration = deferred();
     const releaseRegistration = deferred();
@@ -583,15 +611,197 @@ describe("snapshot-only v2 manifest linearization", () => {
     releaseRegistration.resolve();
     expect((await losingUpload).status).toBe(412);
 
-    expect(await env.SNAPSHOTS.head(`snapshots/${SECOND}`)).not.toBeNull();
     expect((await getV2Snapshot(SECOND)).status).toBe(404);
     const hidden = await (await listV2Snapshots()).json() as V2SnapshotListBody;
     expect(hidden.items.map((item) => item.name)).not.toContain(SECOND);
 
-    const retry = await putV2Snapshot(SECOND, payload);
-    expect(retry.status).toBe(201);
+    const manifest = await storedManifest();
+    const referenced = new Set(manifest.snapshots.map((item) => item.bodyKey));
+    const bodies = await env.SNAPSHOTS.list({ prefix: "bodies/" });
+    const orphan = bodies.objects.find((object) => !referenced.has(object.key));
+    expect(orphan).toBeTruthy();
+    const orphanBody = await env.SNAPSHOTS.get(orphan!.key);
+    expect(orphanBody).not.toBeNull();
+    await env.SNAPSHOTS.put(orphan!.key, await orphanBody!.arrayBuffer(), {
+      customMetadata: { gcAfter: "0" },
+      httpMetadata: { contentType: "application/octet-stream" },
+    });
+    await env.SNAPSHOTS.delete("gc-state.json");
+
+    expect((await listV2Snapshots()).status).toBe(200);
+    expect(await env.SNAPSHOTS.head(orphan!.key)).toBeNull();
+    expect((await getV2Snapshot(SECOND)).status).toBe(404);
+  });
+
+  it("keeps manifest deletion metadata bounded after many generations", async () => {
+    for (let sequence = 10; sequence < 90; sequence++) {
+      const filename = snapshotFilename("auto", sequence);
+      const created = await putV2Snapshot(filename, vpbeBody(sequence));
+      expect(created.status).toBe(201);
+      const deleted = await deleteV2Snapshot(filename, created.headers.get("ETag")!);
+      expect(deleted.status).toBe(204);
+    }
+    const manifest = await storedManifest();
+    expect(manifest.snapshots).toEqual([]);
+    expect(manifest.pendingDeletes).toEqual([]);
+    const stored = await env.SNAPSHOTS.get("manifest.json");
+    expect((await stored!.text()).length).toBeLessThan(256);
+  });
+
+  it("uses a fixed pending-delete budget and recovers across later requests", async () => {
+    const snapshots: Array<{ filename: string; etag: string }> = [];
+    for (let sequence = 10; sequence < 20; sequence++) {
+      const filename = snapshotFilename("backup", sequence);
+      const created = await putV2Snapshot(filename, vpbeBody(sequence));
+      snapshots.push({ filename, etag: created.headers.get("ETag")! });
+    }
+
+    let deleteCalls = 0;
+    let largestBatch = 0;
+    const failingDelete: R2Bucket["delete"] = async (keys) => {
+      deleteCalls += 1;
+      largestBatch = Math.max(largestBatch, Array.isArray(keys) ? keys.length : 1);
+      throw new Error("physical delete unavailable");
+    };
+    const failingBucket = overrideBucket({ delete: failingDelete });
+    for (const snapshot of snapshots) {
+      const response = await fetchWithEnv(
+        { ...configuredEnv(), SNAPSHOTS: failingBucket },
+        v2SnapshotUrl(snapshot.filename),
+        {
+          method: "DELETE",
+          headers: await v2WriteHeaders({ "If-Match": snapshot.etag }),
+        },
+      );
+      expect(response.status).toBe(204);
+    }
+    expect((await storedManifest()).pendingDeletes).toHaveLength(10);
+
+    deleteCalls = 0;
+    largestBatch = 0;
+    let r2Calls = 0;
+    const countedGet: R2Bucket["get"] = async (key, options) => {
+      r2Calls += 1;
+      return env.SNAPSHOTS.get(key, options);
+    };
+    const countedList: R2Bucket["list"] = async (options) => {
+      r2Calls += 1;
+      return env.SNAPSHOTS.list(options);
+    };
+    const countedPut: R2Bucket["put"] = async (key, value, options) => {
+      r2Calls += 1;
+      return env.SNAPSHOTS.put(key, value, options);
+    };
+    const countedDelete: R2Bucket["delete"] = async (keys) => {
+      r2Calls += 1;
+      return failingDelete(keys);
+    };
+    const bounded = await fetchWithEnv(
+      {
+        ...configuredEnv(),
+        SNAPSHOTS: overrideBucket({
+          delete: countedDelete,
+          get: countedGet,
+          list: countedList,
+          put: countedPut,
+        }),
+      },
+      V2_SNAPSHOTS_URL,
+      { headers: await authHeaders() },
+    );
+    expect(bounded.status).toBe(200);
+    expect(deleteCalls).toBe(1);
+    expect(largestBatch).toBe(2);
+    expect(r2Calls).toBeLessThanOrEqual(4);
+    expect((await storedManifest()).pendingDeletes).toHaveLength(10);
+
+    for (const remaining of [8, 6, 4, 2, 0]) {
+      expect((await listV2Snapshots()).status).toBe(200);
+      expect((await storedManifest()).pendingDeletes).toHaveLength(remaining);
+    }
+  });
+
+  it("caps failed cleanup metadata instead of growing the manifest forever", async () => {
+    const snapshots: Array<{ filename: string; etag: string }> = [];
+    for (let sequence = 100; sequence < 165; sequence++) {
+      const filename = snapshotFilename("backup", sequence);
+      const created = await putV2Snapshot(filename, vpbeBody(sequence));
+      snapshots.push({ filename, etag: created.headers.get("ETag")! });
+    }
+    const alwaysFail: R2Bucket["delete"] = async () => {
+      throw new Error("physical delete unavailable");
+    };
+    const failingBucket = overrideBucket({ delete: alwaysFail });
+    for (const snapshot of snapshots.slice(0, 64)) {
+      const response = await fetchWithEnv(
+        { ...configuredEnv(), SNAPSHOTS: failingBucket },
+        v2SnapshotUrl(snapshot.filename),
+        {
+          method: "DELETE",
+          headers: await v2WriteHeaders({ "If-Match": snapshot.etag }),
+        },
+      );
+      expect(response.status).toBe(204);
+    }
+    const overflow = snapshots[64]!;
+    const rejected = await fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: failingBucket },
+      v2SnapshotUrl(overflow.filename),
+      {
+        method: "DELETE",
+        headers: await v2WriteHeaders({ "If-Match": overflow.etag }),
+      },
+    );
+    expect(rejected.status).toBe(503);
+    expect((await rejected.json() as ErrorBody).error.code).toBe("gc_backlog_full");
+    const manifest = await storedManifest();
+    expect(manifest.pendingDeletes).toHaveLength(64);
+    expect(manifest.snapshots.map((item) => item.name)).toEqual([overflow.filename]);
+  });
+
+  it("never lets stale GC delete a replacement generation with the same filename", async () => {
+    const old = await putV2Snapshot(SECOND, vpbeBody(0x22));
+    const oldBodyKey = await bodyKeyFor(SECOND);
+    const alwaysFail: R2Bucket["delete"] = async () => {
+      throw new Error("physical delete unavailable");
+    };
+    const logicalDelete = await fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: overrideBucket({ delete: alwaysFail }) },
+      v2SnapshotUrl(SECOND),
+      {
+        method: "DELETE",
+        headers: await v2WriteHeaders({ "If-Match": old.headers.get("ETag")! }),
+      },
+    );
+    expect(logicalDelete.status).toBe(204);
+
+    const reachedOldDelete = deferred();
+    const releaseOldDelete = deferred();
+    const delayedDelete: R2Bucket["delete"] = async (keys) => {
+      if (Array.isArray(keys) && keys.includes(oldBodyKey)) {
+        reachedOldDelete.resolve();
+        await releaseOldDelete.promise;
+      }
+      return env.SNAPSHOTS.delete(keys);
+    };
+    const staleGc = fetchWithEnv(
+      { ...configuredEnv(), SNAPSHOTS: overrideBucket({ delete: delayedDelete }) },
+      V2_SNAPSHOTS_URL,
+      { headers: await authHeaders() },
+    );
+    await reachedOldDelete.promise;
+
+    const replacementPayload = vpbeBody(0x44);
+    const replacement = await putV2Snapshot(SECOND, replacementPayload);
+    expect(replacement.status).toBe(201);
+    const replacementKey = await bodyKeyFor(SECOND);
+    expect(replacementKey).not.toBe(oldBodyKey);
+    releaseOldDelete.resolve();
+    expect((await staleGc).status).toBe(200);
+
+    expect(await env.SNAPSHOTS.head(replacementKey)).not.toBeNull();
     expect(new Uint8Array(await (await getV2Snapshot(SECOND)).arrayBuffer()))
-      .toEqual(payload);
+      .toEqual(replacementPayload);
   });
 });
 
