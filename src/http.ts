@@ -7,12 +7,17 @@ export type ErrorCode =
   | "invalid_path"
   | "invalid_json"
   | "invalid_magic"
+  | "invalid_content_type"
+  | "invalid_storage"
   | "precondition_required"
   | "precondition_failed"
   | "payload_too_large"
   | "index_too_large"
   | "method_not_allowed"
   | "conflict"
+  | "snapshot_is_head"
+  | "snapshot_not_found"
+  | "storage_unavailable"
   | "rate_limited";
 
 export function jsonResponse(

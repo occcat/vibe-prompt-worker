@@ -10,6 +10,9 @@ export const VAULT_URL = "https://worker.test/v1/vault";
 export const INDEX_URL = "https://worker.test/v1/index";
 export const HEALTH_URL = "https://worker.test/v1/health";
 export const SNAPSHOTS_URL = "https://worker.test/v1/snapshots";
+export const V2_HEALTH_URL = "https://worker.test/v2/health";
+export const V2_HEAD_URL = "https://worker.test/v2/head";
+export const V2_SNAPSHOTS_URL = "https://worker.test/v2/snapshots";
 export const PUSH_URL = "https://worker.test/v1/sync/push";
 export const VAULT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 export const KDF_SALT = "0123456789abcdef0123456789abcdef";
@@ -55,6 +58,10 @@ export async function authHeaders(extra?: HeadersInit): Promise<Headers> {
 
 export async function writeHeaders(extra?: HeadersInit): Promise<Headers> {
   return authHeaders({ [PROTOCOL_HEADER]: "1", ...headerRecord(extra) });
+}
+
+export async function v2WriteHeaders(extra?: HeadersInit): Promise<Headers> {
+  return authHeaders({ [PROTOCOL_HEADER]: "2", ...headerRecord(extra) });
 }
 
 function headerRecord(extra?: HeadersInit): Record<string, string> {
@@ -208,6 +215,74 @@ export async function deleteObject(url: string, extra?: HeadersInit): Promise<Re
 export function snapshotUrl(filename: string): string {
   return `${SNAPSHOTS_URL}/${filename}`;
 }
+
+export function v2SnapshotUrl(filename: string): string {
+  return `${V2_SNAPSHOTS_URL}/${filename}`;
+}
+
+export async function putV2Snapshot(
+  filename: string,
+  body: BodyInit,
+  extra?: HeadersInit,
+): Promise<Response> {
+  return fetchConfigured(v2SnapshotUrl(filename), {
+    method: "PUT",
+    headers: await v2WriteHeaders({
+      "Content-Type": "application/octet-stream",
+      "If-None-Match": "*",
+      ...headerRecord(extra),
+    }),
+    body,
+  });
+}
+
+export async function getV2Snapshot(filename: string): Promise<Response> {
+  return fetchConfigured(v2SnapshotUrl(filename), { headers: await authHeaders() });
+}
+
+export async function listV2Snapshots(): Promise<Response> {
+  return fetchConfigured(V2_SNAPSHOTS_URL, { headers: await authHeaders() });
+}
+
+export async function getV2Head(): Promise<Response> {
+  return fetchConfigured(V2_HEAD_URL, { headers: await authHeaders() });
+}
+
+export async function putV2Head(
+  filename: string,
+  extra?: HeadersInit,
+): Promise<Response> {
+  return fetchConfigured(V2_HEAD_URL, {
+    method: "PUT",
+    headers: await v2WriteHeaders({
+      "Content-Type": "application/json",
+      ...headerRecord(extra),
+    }),
+    body: JSON.stringify({ schema: "vibe-prompt.head/2", snapshot: filename }),
+  });
+}
+
+export async function deleteV2Snapshot(
+  filename: string,
+  etag?: string,
+): Promise<Response> {
+  const extra = etag === undefined ? undefined : { "If-Match": etag };
+  return fetchConfigured(v2SnapshotUrl(filename), {
+    method: "DELETE",
+    headers: await v2WriteHeaders(extra),
+  });
+}
+
+export type V2SnapshotListBody = {
+  schema: string;
+  items: Array<{
+    name: string;
+    size: number;
+    createdAt: string;
+    etag: string;
+    isHead: boolean;
+  }>;
+};
 
 export function snapshotFilename(
   kind: "auto" | "backup",

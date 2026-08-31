@@ -2,14 +2,23 @@ import { verifyAuthorization } from "./auth";
 import { errorResponse, jsonResponse } from "./http";
 import { isBatchPushTooLarge, isObjectPutTooLarge, isSnapshotPutTooLarge } from "./limits";
 import { isSnapshotRoute } from "./paths";
+import { routeSnapshotApi } from "./snapshot-api";
 
 export { VaultObject } from "./vault-object";
 
 const WORKER_NAME = "vibe-prompt-worker";
 const HEALTH_SCHEMA = "vibe-prompt.health/1";
 const HEALTH_CAPABILITIES = ["etag", "if-match", "index-atomic", "batch-push"] as const;
+const HEALTH_V2_SCHEMA = "vibe-prompt.health/2";
+const HEALTH_V2_CAPABILITIES = [
+  "snapshot-head",
+  "snapshot-history",
+  "etag",
+  "if-match",
+] as const;
 const PROTOCOL_HEADER = "X-Vibe-Prompt-Protocol";
 const PROTOCOL_VERSION = "1";
+const PROTOCOL_V2_VERSION = "2";
 const WRITE_METHODS = new Set(["DELETE", "PATCH", "POST", "PUT"]);
 
 const CORS_HEADERS = {
@@ -56,6 +65,17 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     });
   }
 
+  if (request.method === "GET" && pathname === "/v2/health") {
+    return jsonResponse({
+      schema: HEALTH_V2_SCHEMA,
+      name: WORKER_NAME,
+      protocolVersion: 2,
+      backend: "r2-snapshot",
+      capabilities: [...HEALTH_V2_CAPABILITIES],
+      authConfigured: isAuthConfigured(env.AUTH_VALUE),
+    });
+  }
+
   if (isSharePath(pathname)) {
     return errorResponse(404, "not_found", "Not Found");
   }
@@ -75,8 +95,25 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return errorResponse(403, "forbidden", "Sorry, you have supplied an invalid key.");
   }
 
-  if (hasInvalidProtocol(request)) {
-    return errorResponse(400, "invalid_protocol", "X-Vibe-Prompt-Protocol must be 1.");
+  const expectedProtocol = pathname.startsWith("/v2/")
+    ? PROTOCOL_V2_VERSION
+    : PROTOCOL_VERSION;
+  if (hasInvalidProtocol(request, expectedProtocol)) {
+    return errorResponse(
+      400,
+      "invalid_protocol",
+      `X-Vibe-Prompt-Protocol must be ${expectedProtocol}.`,
+    );
+  }
+
+  if (pathname === "/v2/head" || pathname.startsWith("/v2/snapshots")) {
+    if (!hasSnapshotsBinding(env)) {
+      return errorResponse(503, "misconfigured", "Must bind SNAPSHOTS R2 bucket.");
+    }
+    const response = await routeSnapshotApi(request, env.SNAPSHOTS);
+    if (response !== null) {
+      return response;
+    }
   }
 
   if (isObjectPutTooLarge(request) || isBatchPushTooLarge(request)) {
@@ -110,12 +147,12 @@ function isSharePath(pathname: string): boolean {
   return pathname === "/v1/share" || pathname.startsWith("/v1/share/");
 }
 
-function hasInvalidProtocol(request: Request): boolean {
+function hasInvalidProtocol(request: Request, expected: string): boolean {
   const raw = request.headers.get(PROTOCOL_HEADER);
   if (raw === null) {
     return WRITE_METHODS.has(request.method);
   }
-  return raw.trim() !== PROTOCOL_VERSION;
+  return raw.trim() !== expected;
 }
 
 function withCors(response: Response): Response {
