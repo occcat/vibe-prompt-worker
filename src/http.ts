@@ -12,13 +12,10 @@ export type ErrorCode =
   | "precondition_required"
   | "precondition_failed"
   | "payload_too_large"
-  | "index_too_large"
   | "method_not_allowed"
-  | "conflict"
   | "snapshot_is_head"
   | "snapshot_not_found"
-  | "storage_unavailable"
-  | "rate_limited";
+  | "storage_unavailable";
 
 export function jsonResponse(
   data: unknown,
@@ -37,19 +34,4 @@ export function errorResponse(
   extra?: Record<string, unknown>,
 ): Response {
   return jsonResponse({ error: { code, message }, ...extra }, status);
-}
-
-export function quoteEtag(revision: number): string {
-  return `"${revision}"`;
-}
-
-export function revisionHeaders(revision: number): Headers {
-  const headers = new Headers();
-  headers.set("ETag", quoteEtag(revision));
-  headers.set("X-Vibe-Prompt-Revision", String(revision));
-  return headers;
-}
-
-export function emptyRevisionResponse(status: number, revision: number): Response {
-  return new Response(null, { status, headers: revisionHeaders(revision) });
 }

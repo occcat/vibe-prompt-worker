@@ -1,38 +1,30 @@
 import { verifyAuthorization } from "./auth";
 import { errorResponse, jsonResponse } from "./http";
-import { isBatchPushTooLarge, isObjectPutTooLarge, isSnapshotPutTooLarge } from "./limits";
-import { isSnapshotRoute } from "./paths";
 import { routeSnapshotApi } from "./snapshot-api";
 
-export { VaultObject } from "./vault-object";
-
 const WORKER_NAME = "vibe-prompt-worker";
-const HEALTH_SCHEMA = "vibe-prompt.health/1";
-const HEALTH_CAPABILITIES = ["etag", "if-match", "index-atomic", "batch-push"] as const;
-const HEALTH_V2_SCHEMA = "vibe-prompt.health/2";
-const HEALTH_V2_CAPABILITIES = [
+const HEALTH_SCHEMA = "vibe-prompt.health/2";
+const HEALTH_CAPABILITIES = [
   "snapshot-head",
   "snapshot-history",
   "etag",
   "if-match",
 ] as const;
 const PROTOCOL_HEADER = "X-Vibe-Prompt-Protocol";
-const PROTOCOL_VERSION = "1";
-const PROTOCOL_V2_VERSION = "2";
+const PROTOCOL_VERSION = "2";
 const WRITE_METHODS = new Set(["DELETE", "PATCH", "POST", "PUT"]);
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, PUT, DELETE, POST, OPTIONS, HEAD",
+  "Access-Control-Allow-Methods": "GET, PUT, DELETE, OPTIONS, HEAD",
   "Access-Control-Allow-Headers": [
     "Authorization",
     "Content-Type",
     "If-Match",
     "If-None-Match",
     "X-Vibe-Prompt-Protocol",
-    "X-Vibe-Prompt-Device-Id",
   ].join(", "),
-  "Access-Control-Expose-Headers": "ETag, X-Vibe-Prompt-Revision",
+  "Access-Control-Expose-Headers": "ETag",
 };
 
 export default {
@@ -47,43 +39,28 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204 });
   }
-
   if (request.method === "GET" && pathname === "/") {
     return new Response(WORKER_NAME, {
       headers: { "content-type": "text/plain" },
     });
   }
-
-  if (request.method === "GET" && pathname === "/v1/health") {
+  if (request.method === "GET" && pathname === "/v2/health") {
     return jsonResponse({
       schema: HEALTH_SCHEMA,
       name: WORKER_NAME,
-      protocolVersion: 1,
-      backend: "worker",
+      protocolVersion: 2,
+      backend: "r2-snapshot",
       capabilities: [...HEALTH_CAPABILITIES],
       authConfigured: isAuthConfigured(env.AUTH_VALUE),
     });
   }
-
-  if (request.method === "GET" && pathname === "/v2/health") {
-    return jsonResponse({
-      schema: HEALTH_V2_SCHEMA,
-      name: WORKER_NAME,
-      protocolVersion: 2,
-      backend: "r2-snapshot",
-      capabilities: [...HEALTH_V2_CAPABILITIES],
-      authConfigured: isAuthConfigured(env.AUTH_VALUE),
-    });
-  }
-
-  if (isSharePath(pathname)) {
+  if (pathname === "/v1" || pathname.startsWith("/v1/")) {
     return errorResponse(404, "not_found", "Not Found");
   }
 
   if (!isAuthConfigured(env.AUTH_VALUE)) {
     return errorResponse(503, "misconfigured", "Must set AUTH_VALUE environment.");
   }
-
   const authorization = await verifyAuthorization(
     request.headers.get("Authorization"),
     env.AUTH_VALUE,
@@ -94,65 +71,45 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (authorization === "invalid") {
     return errorResponse(403, "forbidden", "Sorry, you have supplied an invalid key.");
   }
-
-  const expectedProtocol = pathname.startsWith("/v2/")
-    ? PROTOCOL_V2_VERSION
-    : PROTOCOL_VERSION;
-  if (hasInvalidProtocol(request, expectedProtocol)) {
+  if (hasInvalidProtocol(request)) {
     return errorResponse(
       400,
       "invalid_protocol",
-      `X-Vibe-Prompt-Protocol must be ${expectedProtocol}.`,
+      `X-Vibe-Prompt-Protocol must be ${PROTOCOL_VERSION}.`,
     );
   }
 
   if (pathname === "/v2/head" || pathname.startsWith("/v2/snapshots")) {
-    if (!hasSnapshotsBinding(env)) {
+    const bucket = snapshotsBucket(env);
+    if (bucket === null) {
       return errorResponse(503, "misconfigured", "Must bind SNAPSHOTS R2 bucket.");
     }
-    const response = await routeSnapshotApi(request, env.SNAPSHOTS);
+    const response = await routeSnapshotApi(request, bucket);
     if (response !== null) {
       return response;
     }
   }
-
-  if (isObjectPutTooLarge(request) || isBatchPushTooLarge(request)) {
-    return errorResponse(413, "payload_too_large", "Payload too large.");
-  }
-
-  if (isSnapshotPutTooLarge(request)) {
-    return errorResponse(413, "payload_too_large", "Payload too large.");
-  }
-
-  if (isSnapshotRoute(pathname) && !hasSnapshotsBinding(env)) {
-    return errorResponse(503, "misconfigured", "Must bind SNAPSHOTS R2 bucket.");
-  }
-
-  return env.VAULT.get(env.VAULT.idFromName("vault")).fetch(request);
+  return errorResponse(404, "not_found", "Not Found");
 }
 
 function isAuthConfigured(value: string | undefined): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function hasSnapshotsBinding(env: Env): boolean {
+function snapshotsBucket(env: Env): R2Bucket | null {
   try {
-    return env.SNAPSHOTS !== undefined && env.SNAPSHOTS !== null;
+    return env.SNAPSHOTS ?? null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function isSharePath(pathname: string): boolean {
-  return pathname === "/v1/share" || pathname.startsWith("/v1/share/");
-}
-
-function hasInvalidProtocol(request: Request, expected: string): boolean {
+function hasInvalidProtocol(request: Request): boolean {
   const raw = request.headers.get(PROTOCOL_HEADER);
   if (raw === null) {
     return WRITE_METHODS.has(request.method);
   }
-  return raw.trim() !== expected;
+  return raw.trim() !== PROTOCOL_VERSION;
 }
 
 function withCors(response: Response): Response {

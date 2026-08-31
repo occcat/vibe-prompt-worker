@@ -207,6 +207,14 @@ describe("snapshot-only v2 current head", () => {
     expect((await missing.json() as ErrorBody).error.code).toBe("snapshot_not_found");
   });
 
+  it("requires a create or update precondition", async () => {
+    expect((await putV2Snapshot(FIRST, vpbeBody())).status).toBe(201);
+    const response = await putV2Head(FIRST);
+    expect(response.status).toBe(428);
+    expect((await response.json() as ErrorBody).error.code)
+      .toBe("precondition_required");
+  });
+
   it("requires JSON and a supported head document", async () => {
     const wrongType = await fetchConfigured(V2_HEAD_URL, {
       method: "PUT",

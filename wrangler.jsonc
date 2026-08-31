@@ -6,19 +6,15 @@
   "observability": {
     "enabled": true
   },
-  // AUTH_VALUE is a runtime Secret (`wrangler secret put AUTH_VALUE` / `.dev.vars`), not a vars entry.
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "VAULT",
-        "class_name": "VaultObject"
-      }
-    ]
-  },
+  // AUTH_VALUE is a runtime Secret (`wrangler secret put AUTH_VALUE`), not a vars entry.
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["VaultObject"]
+    },
+    {
+      "tag": "v2-r2-snapshot-only",
+      "deleted_classes": ["VaultObject"]
     }
   ],
   "r2_buckets": [
