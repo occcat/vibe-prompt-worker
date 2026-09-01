@@ -293,6 +293,8 @@ describe("snapshot-only v2 current head", () => {
     expect(got.headers.get("X-Vibe-Prompt-Manifest-ETag")).toBe(firstEtag);
     expect(await got.json()).toMatchObject({ snapshot: FIRST });
 
+    const weakUpdate = await putV2Head(SECOND, { "If-Match": `W/${firstEtag}` });
+    expect(weakUpdate.status).toBe(412);
     const updated = await putV2Head(SECOND, { "If-Match": firstEtag! });
     expect(updated.status).toBe(200);
     expectV2IntegrityHeaders(updated);
@@ -380,6 +382,8 @@ describe("snapshot-only v2 current head", () => {
 
     expect((await deleteV2Snapshot(SECOND)).status).toBe(428);
     expect((await deleteV2Snapshot(SECOND, '"stale"')).status).toBe(412);
+    expect((await deleteV2Snapshot(SECOND, `W/${second.headers.get("ETag")}`)).status)
+      .toBe(412);
     const deleted = await deleteV2Snapshot(SECOND, second.headers.get("ETag")!);
     expect(deleted.status).toBe(204);
     expect(deleted.headers.get("Cache-Control")).toBe("no-store, no-transform");
