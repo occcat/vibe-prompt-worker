@@ -46,6 +46,15 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
+function expectStrongEtag(value: string | null): void {
+  expect(value).toMatch(/^"[^"\r\n]+"$/);
+}
+
+function expectV2IntegrityHeaders(response: Response): void {
+  expect(response.headers.get("Cache-Control")).toBe("no-store, no-transform");
+  expectStrongEtag(response.headers.get("ETag"));
+}
+
 function overrideBucket(
   overrides: Partial<Pick<R2Bucket, "delete" | "get" | "list" | "put">>,
 ): R2Bucket {
@@ -124,10 +133,14 @@ describe("snapshot-only v2 health and auth", () => {
   });
 
   it("requires the existing derived Bearer token", async () => {
-    expect((await fetchConfigured(V2_SNAPSHOTS_URL)).status).toBe(401);
-    expect((await fetchConfigured(V2_SNAPSHOTS_URL, {
+    const missing = await fetchConfigured(V2_SNAPSHOTS_URL);
+    expect(missing.status).toBe(401);
+    expect(missing.headers.get("Cache-Control")).toBe("no-store, no-transform");
+    const invalid = await fetchConfigured(V2_SNAPSHOTS_URL, {
       headers: { Authorization: "Bearer wrong" },
-    })).status).toBe(403);
+    });
+    expect(invalid.status).toBe(403);
+    expect(invalid.headers.get("Cache-Control")).toBe("no-store, no-transform");
     expect((await listV2Snapshots()).status).toBe(200);
   });
 
@@ -165,15 +178,24 @@ describe("snapshot-only v2 immutable snapshots", () => {
     const second = await putV2Snapshot(SECOND, secondPayload);
     expect(first.status).toBe(201);
     expect(second.status).toBe(201);
-    expect(first.headers.get("ETag")).toMatch(/^".+"$/);
+    expectV2IntegrityHeaders(first);
+    expectStrongEtag(first.headers.get("X-Vibe-Prompt-Manifest-ETag"));
 
-    const downloaded = await getV2Snapshot(FIRST);
+    const downloaded = await fetchConfigured(v2SnapshotUrl(FIRST), {
+      headers: await authHeaders({ "Accept-Encoding": "gzip, br" }),
+    });
     expect(downloaded.status).toBe(200);
+    expectV2IntegrityHeaders(downloaded);
     expect(downloaded.headers.get("ETag")).toBe(first.headers.get("ETag"));
+    expect(downloaded.headers.get("X-Vibe-Prompt-Manifest-ETag")).toBeNull();
     expect(downloaded.headers.get("Content-Type")).toBe("application/octet-stream");
     expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(firstPayload);
 
-    const listed = await (await listV2Snapshots()).json() as V2SnapshotListBody;
+    const listResponse = await listV2Snapshots();
+    expectV2IntegrityHeaders(listResponse);
+    expect(listResponse.headers.get("X-Vibe-Prompt-Manifest-ETag"))
+      .toBe(listResponse.headers.get("ETag"));
+    const listed = await listResponse.json() as V2SnapshotListBody;
     expect(listed.schema).toBe("vibe-prompt.snapshots/2");
     expect(listed.items.map((item) => item.name)).toEqual([SECOND, FIRST]);
     expect(listed.items.every((item) => !item.isHead)).toBe(true);
@@ -258,18 +280,26 @@ describe("snapshot-only v2 current head", () => {
     const created = await putV2Head(FIRST, { "If-None-Match": "*" });
     expect(created.status).toBe(201);
     const firstEtag = created.headers.get("ETag");
-    expect(firstEtag).toBeTruthy();
+    expectV2IntegrityHeaders(created);
+    expect(created.headers.get("X-Vibe-Prompt-Manifest-ETag")).toBe(firstEtag);
     expect(await created.json()).toMatchObject({
       schema: "vibe-prompt.head/2",
       snapshot: FIRST,
     });
 
     const got = await getV2Head();
+    expectV2IntegrityHeaders(got);
     expect(got.headers.get("ETag")).toBe(firstEtag);
+    expect(got.headers.get("X-Vibe-Prompt-Manifest-ETag")).toBe(firstEtag);
     expect(await got.json()).toMatchObject({ snapshot: FIRST });
 
+    const weakUpdate = await putV2Head(SECOND, { "If-Match": `W/${firstEtag}` });
+    expect(weakUpdate.status).toBe(412);
     const updated = await putV2Head(SECOND, { "If-Match": firstEtag! });
     expect(updated.status).toBe(200);
+    expectV2IntegrityHeaders(updated);
+    expect(updated.headers.get("X-Vibe-Prompt-Manifest-ETag"))
+      .toBe(updated.headers.get("ETag"));
     expect(updated.headers.get("ETag")).not.toBe(firstEtag);
     const list = await (await listV2Snapshots()).json() as V2SnapshotListBody;
     expect(list.items.find((item) => item.name === SECOND)?.isHead).toBe(true);
@@ -352,9 +382,16 @@ describe("snapshot-only v2 current head", () => {
 
     expect((await deleteV2Snapshot(SECOND)).status).toBe(428);
     expect((await deleteV2Snapshot(SECOND, '"stale"')).status).toBe(412);
+    expect((await deleteV2Snapshot(SECOND, `W/${second.headers.get("ETag")}`)).status)
+      .toBe(412);
     const deleted = await deleteV2Snapshot(SECOND, second.headers.get("ETag")!);
     expect(deleted.status).toBe(204);
+    expect(deleted.headers.get("Cache-Control")).toBe("no-store, no-transform");
     expect(deleted.headers.get("ETag")).toBe(second.headers.get("ETag"));
+    expectStrongEtag(deleted.headers.get("X-Vibe-Prompt-Manifest-ETag"));
+    const afterDelete = await listV2Snapshots();
+    expect(deleted.headers.get("X-Vibe-Prompt-Manifest-ETag"))
+      .toBe(afterDelete.headers.get("X-Vibe-Prompt-Manifest-ETag"));
     expect((await getV2Snapshot(SECOND)).status).toBe(404);
   });
 });

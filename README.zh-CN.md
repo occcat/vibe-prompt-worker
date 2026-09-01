@@ -64,6 +64,9 @@ X-Vibe-Prompt-Protocol: 2
 {"error":{"code":"not_found","message":"Not Found"}}
 ```
 
+所有 `/v2` 响应都会返回 `Cache-Control: no-store, no-transform`，
+阻止 Cloudflare 及其他中间层压缩或转换由强完整性 ETag 与 CAS ETag 标识的内容。
+
 ### 健康检查
 
 `GET /v2/health` 返回 `vibe-prompt.health/2`、协议版本 `2`、后端 `r2-snapshot`，以及
@@ -96,10 +99,13 @@ vibe-prompt-(auto|backup)_YYYYMMDDTHHMMSSZ_<8 位小写十六进制>_<6 位小�
 上传成功后，`ETag` 返回正文 ETag，
 `X-Vibe-Prompt-Manifest-ETag` 返回新的控制版本。
 列表 schema 为 `vibe-prompt.snapshots/2`，每项包含 `name`、`size`、`createdAt`、
-`etag` 和 `isHead`。
+`etag` 和 `isHead`。列表成功时，`ETag` 和 `X-Vibe-Prompt-Manifest-ETag` 会返回同一个
+强 manifest 版本。
 
 删除必须使用服务返回的带引号 ETag 作为 `If-Match`。
 过期 ETag 返回 `412`；删除当前 head 指向的快照返回 `409 snapshot_is_head`。
+删除成功时，`ETag` 保留被删除的正文 ETag，
+`X-Vibe-Prompt-Manifest-ETag` 返回清理后的最终控制版本。
 
 ### 当前 head
 
@@ -121,6 +127,8 @@ ETag 标识整个 manifest 版本，
 正文包含相同 schema 和 `snapshot`；服务端生成 `updatedAt`。
 目标快照必须已在同一 manifest 中。并发或过期写返回 `412`，
 客户端应重新获取状态，避免静默覆盖其他设备。
+`GET` 和 `PUT` 成功时，`ETag` 与 `X-Vibe-Prompt-Manifest-ETag`
+返回相同的强控制版本；客户端应优先使用专用响应头作为 manifest CAS 令牌。
 
 每次上传先创建唯一且不可变的 generation 正文，再用 manifest CAS 注册。
 CAS 竞争失败时，未注册 generation 不会出现在列表、head 或下载接口中，
