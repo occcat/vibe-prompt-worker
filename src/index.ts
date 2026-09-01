@@ -12,6 +12,7 @@ const HEALTH_CAPABILITIES = [
 ] as const;
 const PROTOCOL_HEADER = "X-Vibe-Prompt-Protocol";
 const PROTOCOL_VERSION = "2";
+const V2_CACHE_CONTROL = "no-store, no-transform";
 const WRITE_METHODS = new Set(["DELETE", "PATCH", "POST", "PUT"]);
 
 const CORS_HEADERS = {
@@ -29,7 +30,7 @@ const CORS_HEADERS = {
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-    return withCors(await handleRequest(request, env));
+    return withResponseHeaders(request, await handleRequest(request, env));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -112,14 +113,21 @@ function hasInvalidProtocol(request: Request): boolean {
   return raw.trim() !== PROTOCOL_VERSION;
 }
 
-function withCors(response: Response): Response {
+function withResponseHeaders(request: Request, response: Response): Response {
   const headers = new Headers(response.headers);
   for (const [name, value] of Object.entries(CORS_HEADERS)) {
     headers.set(name, value);
+  }
+  if (isV2Path(new URL(request.url).pathname)) {
+    headers.set("Cache-Control", V2_CACHE_CONTROL);
   }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+}
+
+function isV2Path(pathname: string): boolean {
+  return pathname === "/v2" || pathname.startsWith("/v2/");
 }

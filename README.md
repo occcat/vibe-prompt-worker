@@ -64,6 +64,10 @@ Errors use a stable JSON envelope:
 {"error":{"code":"not_found","message":"Not Found"}}
 ```
 
+Every `/v2` response includes `Cache-Control: no-store, no-transform`. This keeps Cloudflare and
+other intermediaries from compressing or otherwise transforming bytes associated with strong
+integrity and CAS ETags.
+
 ### Health
 
 `GET /v2/health` returns `vibe-prompt.health/2`, protocol version `2`, backend `r2-snapshot`, and
@@ -95,10 +99,13 @@ Upload requirements:
 An existing name returns `412 precondition_failed`; it is never overwritten. A successful upload
 returns the body ETag in `ETag` and the new control revision in
 `X-Vibe-Prompt-Manifest-ETag`. The list schema is `vibe-prompt.snapshots/2`, with `name`, `size`,
-`createdAt`, `etag`, and `isHead` for each item.
+`createdAt`, `etag`, and `isHead` for each item. A successful list returns the same strong manifest
+revision in both `ETag` and `X-Vibe-Prompt-Manifest-ETag`.
 
 Deletion requires `If-Match` with the quoted ETag returned by the service. A stale ETag returns
-`412`. Deleting the snapshot currently referenced by head returns `409 snapshot_is_head`.
+`412`. Deleting the snapshot currently referenced by head returns `409 snapshot_is_head`. A
+successful deletion preserves the deleted body ETag in `ETag` and returns the final control
+revision in `X-Vibe-Prompt-Manifest-ETag`.
 
 ### Current head
 
@@ -119,6 +126,9 @@ an older head ETag stale. After uploading a snapshot, use its
 `Content-Type: application/json` and contains the same schema plus `snapshot`; the server supplies
 `updatedAt`. The referenced snapshot must already be in the same manifest. A racing or stale write
 returns `412`, so clients can refetch instead of silently overwriting another device.
+Successful `GET` and `PUT` responses return the same strong control revision in both `ETag` and
+`X-Vibe-Prompt-Manifest-ETag`; clients should prefer the dedicated header as their manifest CAS
+token.
 
 Each upload gets a unique immutable generation body key before manifest registration. If CAS loses
 a race, the unregistered generation stays invisible to list, head, and download and bounded orphan

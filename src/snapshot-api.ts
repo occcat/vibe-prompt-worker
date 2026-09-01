@@ -9,6 +9,7 @@ const GC_SCAN_KEY = "gc-state.json";
 const GC_SCAN_LIMIT = 8;
 const GC_STATE_SCHEMA = "vibe-prompt.gc-state/2";
 const MANIFEST_KEY = "manifest.json";
+const MANIFEST_ETAG_HEADER = "X-Vibe-Prompt-Manifest-ETag";
 const MANIFEST_SCHEMA = "vibe-prompt.manifest/2";
 const SNAPSHOT_CONTENT_TYPE = "application/octet-stream";
 const SNAPSHOTS_SCHEMA = "vibe-prompt.snapshots/2";
@@ -171,9 +172,11 @@ async function putHead(request: Request, bucket: R2Bucket): Promise<Response> {
   if (stored.type === "conflict") {
     return preconditionFailed();
   }
-  return jsonResponse(head, precondition.create ? 201 : 200, {
-    ETag: httpEtag(stored.object),
-  });
+  return jsonResponse(
+    head,
+    precondition.create ? 201 : 200,
+    manifestRevisionHeaders(httpEtag(stored.object)),
+  );
 }
 
 async function listSnapshots(bucket: R2Bucket): Promise<Response> {
@@ -296,7 +299,7 @@ async function putSnapshot(
     status: 201,
     headers: {
       ETag: item.etag,
-      "X-Vibe-Prompt-Manifest-ETag": httpEtag(stored.object),
+      [MANIFEST_ETAG_HEADER]: httpEtag(stored.object),
     },
   });
 }
@@ -343,12 +346,18 @@ async function deleteSnapshot(
     return preconditionFailed();
   }
 
-  await cleanPendingDeletes(
+  const cleaned = await cleanPendingDeletes(
     bucket,
     { document: next, etag: stored.object.etag },
     1,
   );
-  return new Response(null, { status: 204, headers: { ETag: item.etag } });
+  return new Response(null, {
+    status: 204,
+    headers: {
+      ETag: item.etag,
+      [MANIFEST_ETAG_HEADER]: quotedEtag(cleaned.etag!),
+    },
+  });
 }
 
 async function loadAndCleanManifest(bucket: R2Bucket): Promise<ManifestLoadResult> {
@@ -789,11 +798,21 @@ function hasContentType(request: Request, expected: string): boolean {
 }
 
 function manifestEtagHeaders(state: ManifestState): HeadersInit | undefined {
-  return state.etag === null ? undefined : { ETag: `"${state.etag}"` };
+  return state.etag === null
+    ? undefined
+    : manifestRevisionHeaders(quotedEtag(state.etag));
+}
+
+function manifestRevisionHeaders(etag: string): HeadersInit {
+  return { ETag: etag, [MANIFEST_ETAG_HEADER]: etag };
 }
 
 function httpEtag(object: R2Object): string {
-  return object.httpEtag === "" ? `"${object.etag}"` : object.httpEtag;
+  return quotedEtag(object.etag);
+}
+
+function quotedEtag(value: string): string {
+  return `"${value}"`;
 }
 
 function isQuotedEtag(value: string): boolean {
