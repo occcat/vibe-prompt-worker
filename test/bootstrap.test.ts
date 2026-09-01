@@ -11,9 +11,11 @@ describe("snapshot-only bootstrap routes", () => {
     const root = await exports.default.fetch("https://worker.test/");
     expect(root.status).toBe(200);
     expect(await root.text()).toBe("vibe-prompt-worker");
+    expect(root.headers.get("Cache-Control")).toBeNull();
 
     const health = await exports.default.fetch(HEALTH_URL);
     expect(health.status).toBe(200);
+    expect(health.headers.get("Cache-Control")).toBe("no-store, no-transform");
     expect(await health.json()).toEqual({
       schema: "vibe-prompt.health/2",
       name: "vibe-prompt-worker",
@@ -65,5 +67,6 @@ describe("snapshot-only bootstrap routes", () => {
       .toBe("ETag, X-Vibe-Prompt-Manifest-ETag");
     expect(response.headers.get("Access-Control-Allow-Headers"))
       .not.toContain("X-Vibe-Prompt-Device-Id");
+    expect(response.headers.get("Cache-Control")).toBe("no-store, no-transform");
   });
 });
